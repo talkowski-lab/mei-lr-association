@@ -28,14 +28,14 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: alyenkin
+          password: ${{ secrets.GHCR_PAT }}
       
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/alyenkin/mei-lr-association
 
       - name: Build and push docker containers
         uses: docker/build-push-action@v6
