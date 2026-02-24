@@ -11,7 +11,8 @@ parser.add_argument("--sample-list")
 parser.add_argument("--gs-vds-uri")
 args = parser.parse_args()
 
-hl.init(default_reference='GRCh38')
+hl.init()
+hl.default_reference = "GRCh38"
 
 with open(args.variant_list) as inf:
     variant_list = [line.strip() for line in inf]
@@ -56,7 +57,7 @@ t = t.annotate(
     alt=rhs[2],
 )
 t = t.annotate(
-    locus=hl.locus(t.contig, t.pos),
+    locus=hl.locus(t.contig, t.pos, reference_genome="GRCh38"),
     alleles=[t.ref, t.alt]
 ).key_by('locus', 'alleles')
 
