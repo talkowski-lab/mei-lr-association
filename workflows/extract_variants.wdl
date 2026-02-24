@@ -43,8 +43,8 @@ task ExtractVariantsVDS {
 
     runtime {
         docker: "ghcr.io/alyenkin/mei-lr-association:" + Branch
-        memory: "32G"
-        cpu: 8
+        memory: "128G"
+        cpu: 64
         disks: "local-disk 100 SSD"
     }
     

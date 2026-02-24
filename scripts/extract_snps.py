@@ -11,7 +11,19 @@ parser.add_argument("--sample-list")
 parser.add_argument("--gs-vds-uri")
 args = parser.parse_args()
 
-hl.init()
+hl.init(
+    spark_conf={
+        'spark.local.dir': '/cromwell_root',  # Local SSD for Spark shuffle/spill
+        'spark.executor.instances': '4',
+        'spark.executor.cores': '16',
+        'spark.executor.memory': '64g',
+        'spark.driver.memory': '64g',
+        'spark.sql.shuffle.partitions': '100',
+        'spark.default.parallelism': '100',
+        'spark.memory.fraction': '0.8',
+        'spark.memory.storageFraction': '0.2'
+    }
+)
 hl.default_reference = "GRCh38"
 
 with open(args.variant_list) as inf:
