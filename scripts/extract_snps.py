@@ -62,7 +62,7 @@ t = t.annotate(
 ).key_by('locus', 'alleles')
 
 # Input parameters
-vds = hl.vds.read_vds(args.gs_vds_ri)
+vds = hl.vds.read_vds(args.gs_vds_uri)
 vds_f = hl.vds.filter_intervals(
     vds,
     [hl.parse_locus_interval(x, reference_genome="GRCh38")
