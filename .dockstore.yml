@@ -1,6 +1,11 @@
 version: 1.2
 workflows:
   - subclass: WDL 
-    primaryDescriptorPath: /workflows/ExtractVariants.wdl
     name: ExtractVariants
+    primaryDescriptorPath: /workflows/ExtractVariants.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
   
