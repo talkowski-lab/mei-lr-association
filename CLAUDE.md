@@ -42,8 +42,9 @@ Types the internal repeat structure of SVA elements from a FASTA.
 
 Extracts per-read methylation over insertion sites from a haplotagged PacBio HiFi modBAM.
 
-- Inputs: one indexed modBAM (MM/ML tags + `HP` haplotag) and a BED of insertion loci (~2–4 kb each). Output: one TSV row per (locus, read).
+- Inputs: one indexed modBAM (MM/ML tags + `HP` haplotag) and a BED of insertion loci. The BED requires 6 columns — `chrom, start, end, name, min_len, max_len` — where `min_len`/`max_len` bound the expected insertion length in bp. Output: one TSV row per (locus, read).
 - `extract_insertion_methylation.py` (pysam) walks each read's CIGAR to find the large `I` (insertion) op anchored at the locus, extracts the inserted bases, and intersects them with the read's `modified_bases` (5mC `m` / 5hmC `h`). Emits the insertion sequence, haplotype, a per-base methylation string, and per-mod summary stats.
+- Accepted insertion length is per-locus: an `I` op of length `L` qualifies when `min_len - LenTolerance <= L <= max_len + LenTolerance` (`--len-tolerance`, default 100 bp), replacing the old global `--min-ins-len`/`--max-ins-len`.
 - Key correctness invariant: `read.modified_bases` positions and CIGAR query offsets are both in `query_sequence` coordinates (forward-reference oriented), so they intersect directly — use `modified_bases`, **not** `modified_bases_forward`. Probability = `(qual + 0.5) / 256`; `qual == -1` is a no-call.
 - Docker image built from `envs/methylation/Dockerfile` (python + pysam), published to `ghcr.io/alyenkin/insertion-methylation`; WDL selects the tag via the `Branch` input. The WDL symlinks `BamIndex` next to `Bam` so pysam finds the `.bai`.
 

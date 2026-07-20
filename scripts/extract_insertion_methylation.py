@@ -29,10 +29,15 @@ def parse_args():
     parser.add_argument("--bam", required=True,
                         help="Indexed, haplotagged modBAM (.bai co-located).")
     parser.add_argument("--loci-bed", required=True,
-                        help="BED of insertion loci: chrom, start, end, [name].")
+                        help="BED of insertion loci: chrom, start, end, name, "
+                             "min_len, max_len. min_len/max_len bound the "
+                             "expected insertion length (bp); the accepted range "
+                             "is widened by --len-tolerance on each side.")
     parser.add_argument("--output", default="insertion_methylation.tsv")
-    parser.add_argument("--min-ins-len", type=int, default=2000)
-    parser.add_argument("--max-ins-len", type=int, default=4000)
+    parser.add_argument("--len-tolerance", type=int, default=100,
+                        help="bp added on each side of each locus's "
+                             "[min_len, max_len]; an insertion of length L is "
+                             "accepted when min_len - tol <= L <= max_len + tol.")
     parser.add_argument("--anchor-pad", type=int, default=100,
                         help="bp window around the BED interval within which an "
                              "insertion anchor is accepted.")
@@ -44,16 +49,25 @@ def parse_args():
 
 
 def read_bed(path):
-    """Yield (chrom, start, end, name) from a BED file, skipping headers."""
+    """Yield (chrom, start, end, name, min_len, max_len), skipping headers.
+
+    Expects at least 6 columns: chrom, start, end, name, min_len, max_len.
+    min_len/max_len bound the expected insertion length in bp.
+    """
     with open(path) as inf:
-        for i, line in enumerate(inf):
+        for i, line in enumerate(inf, start=1):
             line = line.strip()
             if not line or line.startswith(("#", "track", "browser")):
                 continue
             fields = line.split("\t") if "\t" in line else line.split()
+            if len(fields) < 6:
+                raise ValueError(
+                    f"{path} line {i}: expected >=6 columns (chrom, start, end, "
+                    f"name, min_len, max_len), got {len(fields)}: {line!r}")
             chrom, start, end = fields[0], int(fields[1]), int(fields[2])
-            name = fields[3] if len(fields) > 3 else f"{chrom}:{start}-{end}"
-            yield chrom, start, end, name
+            name = fields[3] if fields[3] else f"{chrom}:{start}-{end}"
+            min_len, max_len = int(fields[4]), int(fields[5])
+            yield chrom, start, end, name, min_len, max_len
 
 
 def find_insertions(read, min_len, max_len):
@@ -130,9 +144,11 @@ def main():
         writer = csv.writer(outf, delimiter="\t")
         writer.writerow(COLUMNS)
 
-        for chrom, start, end, name in read_bed(args.loci_bed):
+        for chrom, start, end, name, min_len, max_len in read_bed(args.loci_bed):
             lo = start - args.anchor_pad
             hi = end + args.anchor_pad
+            min_ins_len = max(1, min_len - args.len_tolerance)
+            max_ins_len = max_len + args.len_tolerance
             for read in bam.fetch(chrom, max(0, lo), hi):
                 if read.is_unmapped or read.is_secondary or read.is_supplementary:
                     continue
@@ -140,7 +156,7 @@ def main():
                 # Largest qualifying insertion anchored within the window.
                 best = None
                 for q_start, ins_len, anchor in find_insertions(
-                        read, args.min_ins_len, args.max_ins_len):
+                        read, min_ins_len, max_ins_len):
                     if lo <= anchor <= hi and (best is None or ins_len > best[1]):
                         best = (q_start, ins_len, anchor)
                 if best is None:

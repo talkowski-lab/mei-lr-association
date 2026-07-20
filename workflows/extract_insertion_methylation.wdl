@@ -6,8 +6,7 @@ workflow ExtractInsertionMethylation {
         File BamIndex
         File LociBed
         String Branch = "main"
-        Int MinInsLen = 2000
-        Int MaxInsLen = 4000
+        Int LenTolerance = 100
         Int AnchorPad = 100
         String ModCodes = "m,h"
         Float ProbThreshold = 0.5
@@ -19,8 +18,7 @@ workflow ExtractInsertionMethylation {
             BamIndex = BamIndex,
             LociBed = LociBed,
             Branch = Branch,
-            MinInsLen = MinInsLen,
-            MaxInsLen = MaxInsLen,
+            LenTolerance = LenTolerance,
             AnchorPad = AnchorPad,
             ModCodes = ModCodes,
             ProbThreshold = ProbThreshold
@@ -37,8 +35,7 @@ task ExtractMethylation {
         File BamIndex
         File LociBed
         String Branch = "main"
-        Int MinInsLen = 2000
-        Int MaxInsLen = 4000
+        Int LenTolerance = 100
         Int AnchorPad = 100
         String ModCodes = "m,h"
         Float ProbThreshold = 0.5
@@ -57,8 +54,7 @@ task ExtractMethylation {
             --bam input.bam \
             --loci-bed ~{LociBed} \
             --output insertion_methylation.tsv \
-            --min-ins-len ~{MinInsLen} \
-            --max-ins-len ~{MaxInsLen} \
+            --len-tolerance ~{LenTolerance} \
             --anchor-pad ~{AnchorPad} \
             --mod-codes ~{ModCodes} \
             --prob-threshold ~{ProbThreshold}
