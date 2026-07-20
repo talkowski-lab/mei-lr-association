@@ -1,6 +1,7 @@
 name: Methylation Docker Image CI
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - 'scripts/**'                  # any script baked into the image
