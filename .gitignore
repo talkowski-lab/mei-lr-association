@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# WDL / Cromwell / womtool run artifacts
+cromwell-executions/
+cromwell-workflow-logs/
+*.womtool.json
+
+# Bioinformatics data / sequencing artifacts (keep out of git)
+*.bam
+*.bai
+*.cram
+*.crai
+*.sam
+*.fa
+*.fasta
+*.fai
+*.fastq
+*.fq
+*.gz
+*.vcf
+*.tbi
+*.bcf
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*~

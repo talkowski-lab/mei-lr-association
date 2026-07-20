@@ -1,17 +1,17 @@
-name: Docker Image CI
+name: Methylation Docker Image CI
 
 on:
   push:
     paths:
-      - 'scripts/**'            # any script baked into the image
-      - 'envs/hail/Dockerfile'  # the env's own Dockerfile
+      - 'scripts/**'                  # any script baked into the image
+      - 'envs/methylation/Dockerfile' # the env's own Dockerfile
     branches:
       - main
       - develop
   pull_request:
     paths:
       - 'scripts/**'
-      - 'envs/hail/Dockerfile'
+      - 'envs/methylation/Dockerfile'
     branches:
       - main
 
@@ -32,18 +32,18 @@ jobs:
           registry: ghcr.io
           username: alyenkin
           password: ${{ secrets.GHCR_PAT }}
-      
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/alyenkin/mei-lr-association
+          images: ghcr.io/alyenkin/insertion-methylation
 
       - name: Build and push docker containers
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: envs/hail/Dockerfile
+          file: envs/methylation/Dockerfile
           push: true
           tags: |
             ${{ steps.meta.outputs.tags }}

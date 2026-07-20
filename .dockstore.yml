@@ -9,7 +9,7 @@ workflows:
       tags:
         - /.*/
 
-  - subclass: WDL 
+  - subclass: WDL
     name: SVA_Typer
     primaryDescriptorPath: /workflows/sva_typer.wdl
     filters:
@@ -17,4 +17,13 @@ workflows:
         - main
       tags:
         - /.*/
-  
+
+  - subclass: WDL
+    name: ExtractInsertionMethylation
+    primaryDescriptorPath: /workflows/extract_insertion_methylation.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
+
