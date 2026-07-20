@@ -5,7 +5,7 @@ workflow ExtractInsertionMethylation {
         File Bam
         File BamIndex
         File LociBed
-        String Branch = "main"
+        String ImageTag = "latest"
         Int LenTolerance = 100
         Int AnchorPad = 100
         String ModCodes = "m,h"
@@ -17,7 +17,7 @@ workflow ExtractInsertionMethylation {
             Bam = Bam,
             BamIndex = BamIndex,
             LociBed = LociBed,
-            Branch = Branch,
+            ImageTag = ImageTag,
             LenTolerance = LenTolerance,
             AnchorPad = AnchorPad,
             ModCodes = ModCodes,
@@ -34,7 +34,7 @@ task ExtractMethylation {
         File Bam
         File BamIndex
         File LociBed
-        String Branch = "main"
+        String ImageTag = "latest"
         Int LenTolerance = 100
         Int AnchorPad = 100
         String ModCodes = "m,h"
@@ -61,7 +61,7 @@ task ExtractMethylation {
     >>>
 
     runtime {
-        docker: "ghcr.io/alyenkin/insertion-methylation:" + Branch
+        docker: "ayenkin1871/mei-lr-association-methylation:" + ImageTag
         memory: "16G"
         cpu: 4
         disks: "local-disk " + disk_size + " SSD"

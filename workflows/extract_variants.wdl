@@ -5,7 +5,7 @@ workflow ExtractVariants {
         String VDSUri
         File VariantList
         File SampleList
-        String Branch = "main"
+        String ImageTag = "latest"
     }
     
     call ExtractVariantsVDS {
@@ -13,7 +13,7 @@ workflow ExtractVariants {
             VDSUri = VDSUri,
             VariantList = VariantList,
             SampleList = SampleList,
-            Branch = Branch
+            ImageTag = ImageTag
     }
 
     output {
@@ -26,7 +26,7 @@ task ExtractVariantsVDS {
         String VDSUri
         File VariantList
         File SampleList
-        String Branch = "main"
+        String ImageTag = "latest"
     }
 
     command <<<
@@ -42,7 +42,7 @@ task ExtractVariantsVDS {
     >>>
 
     runtime {
-        docker: "ghcr.io/alyenkin/mei-lr-association:" + Branch
+        docker: "ayenkin1871/mei-lr-association-hail:" + ImageTag
         memory: "128G"
         cpu: 64
         disks: "local-disk 100 SSD"
