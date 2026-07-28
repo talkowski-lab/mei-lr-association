@@ -27,3 +27,11 @@ workflows:
       tags:
         - /.*/
 
+  - subclass: WDL
+    name: ConcatenateColumnFiles
+    primaryDescriptorPath: /workflows/concat_files.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
