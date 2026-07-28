@@ -33,7 +33,9 @@ def parse_args():
                              "min_len, max_len. min_len/max_len bound the "
                              "expected insertion length (bp); the accepted range "
                              "is widened by --len-tolerance on each side.")
-    parser.add_argument("--output", default="insertion_methylation.tsv")
+    parser.add_argument("--prefix", required=True,
+                        help="Output basename prefix; the table is written to "
+                             "'<prefix>.insertion_methylation.tsv'.")
     parser.add_argument("--len-tolerance", type=int, default=100,
                         help="bp added on each side of each locus's "
                              "[min_len, max_len]; an insertion of length L is "
@@ -140,7 +142,8 @@ def main():
 
     bam = pysam.AlignmentFile(args.bam, "rb")
 
-    with open(args.output, "w", newline="") as outf:
+    output_path = f"{args.prefix}.insertion_methylation.tsv"
+    with open(output_path, "w", newline="") as outf:
         writer = csv.writer(outf, delimiter="\t")
         writer.writerow(COLUMNS)
 

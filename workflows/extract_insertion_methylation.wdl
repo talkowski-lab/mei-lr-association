@@ -5,6 +5,7 @@ workflow ExtractInsertionMethylation {
         File Bam
         File BamIndex
         File LociBed
+        String Prefix
         String ImageTag = "latest"
         Int LenTolerance = 100
         Int AnchorPad = 100
@@ -17,6 +18,7 @@ workflow ExtractInsertionMethylation {
             Bam = Bam,
             BamIndex = BamIndex,
             LociBed = LociBed,
+            Prefix = Prefix,
             ImageTag = ImageTag,
             LenTolerance = LenTolerance,
             AnchorPad = AnchorPad,
@@ -34,6 +36,7 @@ task ExtractMethylation {
         File Bam
         File BamIndex
         File LociBed
+        String Prefix
         String ImageTag = "latest"
         Int LenTolerance = 100
         Int AnchorPad = 100
@@ -53,7 +56,7 @@ task ExtractMethylation {
         python3 /scripts/extract_insertion_methylation.py \
             --bam input.bam \
             --loci-bed ~{LociBed} \
-            --output insertion_methylation.tsv \
+            --prefix ~{Prefix} \
             --len-tolerance ~{LenTolerance} \
             --anchor-pad ~{AnchorPad} \
             --mod-codes ~{ModCodes} \
