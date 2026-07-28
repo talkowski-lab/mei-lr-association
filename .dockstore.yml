@@ -35,3 +35,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: RenderRmarkdownReport
+    primaryDescriptorPath: /workflows/render_rmarkdown.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
