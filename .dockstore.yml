@@ -44,3 +44,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: AssemblyCoverage
+    primaryDescriptorPath: /workflows/assembly_coverage.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
