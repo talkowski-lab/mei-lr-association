@@ -1,18 +1,18 @@
-name: Coverage Docker Image CI
+name: Bioinformatics Docker Image CI
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - 'scripts/**'                # any script baked into the image
-      - 'envs/coverage/Dockerfile'  # the env's own Dockerfile
+      - 'scripts/**'                     # any script baked into the image
+      - 'envs/bioinformatics/Dockerfile' # the env's own Dockerfile
     branches:
       - main
       - develop
   pull_request:
     paths:
       - 'scripts/**'
-      - 'envs/coverage/Dockerfile'
+      - 'envs/bioinformatics/Dockerfile'
     branches:
       - main
 
@@ -36,7 +36,7 @@ jobs:
         id: meta
         run: |
           REPO_NAME=${GITHUB_REPOSITORY##*/}
-          ENV_NAME=$(basename "$(dirname envs/coverage/Dockerfile)")
+          ENV_NAME=$(basename "$(dirname envs/bioinformatics/Dockerfile)")
           echo "IMAGE=${{ vars.DOCKERHUB_USERNAME }}/${REPO_NAME}-${ENV_NAME}" >> "$GITHUB_OUTPUT"
           echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
@@ -44,7 +44,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: envs/coverage/Dockerfile
+          file: envs/bioinformatics/Dockerfile
           push: true
           tags: |
             ${{ steps.meta.outputs.IMAGE }}:latest
