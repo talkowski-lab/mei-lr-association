@@ -53,13 +53,21 @@ task AlignAssembly {
         Int? DiskGB
     }
 
-    Int auto_disk_size = ceil((size(Contigs, "GB") + size(Reference, "GB")) * 4) + 20
+    # +2x Contigs size for the intermediate SAM file (uncompressed, written to disk rather
+    # than piped straight into samtools sort -- see comment in command below).
+    Int auto_disk_size = ceil((size(Contigs, "GB") * 3 + size(Reference, "GB")) * 4) + 20
 
     command <<<
         set -euo pipefail
 
-        minimap2 -ax ~{MinimapPreset} -t ~{CPU} ~{Reference} ~{Contigs} \
-            | samtools sort -@ ~{CPU} -o ~{Prefix}.bam -
+        # minimap2's SAM output is written to a file rather than piped directly into
+        # samtools sort: piping the two together can race on writing/reading the SAM
+        # header when the reference has many contigs (e.g. hg38-style chrUn_*/alt/random
+        # scaffolds), corrupting one @SQ line and making samtools sort fail with
+        # "bad or missing LN tag". Writing to a file first fully decouples the two steps.
+        minimap2 -ax ~{MinimapPreset} -t ~{CPU} ~{Reference} ~{Contigs} > aligned.sam
+
+        samtools sort -@ ~{CPU} -o ~{Prefix}.bam aligned.sam
 
         samtools index ~{Prefix}.bam
     >>>
