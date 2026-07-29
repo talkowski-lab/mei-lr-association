@@ -1,0 +1,9 @@
+## General-purpose bioinformatics environment shared by workflows that just need
+## standard command-line tools (samtools, bedtools, minimap2, bcftools, tabix)
+## rather than a bespoke script-driven pipeline.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        samtools bcftools bedtools tabix minimap2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/ ./scripts/
+CMD ["bash"]

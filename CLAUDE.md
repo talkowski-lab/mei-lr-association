@@ -13,7 +13,7 @@ Two unrelated pipelines share this repo; they do not call each other.
 ### Overall Organization
 - workflows/ contains any WDLs that will be used for pipelines, subfolders and utility WDL files are allowed
 - scripts/ contains any scripts that will be used within custom environments for pipelines, every dockerfile should copy the entire scripts/ folder 
-- envs/ contain Dockerfiles for custom environments used in workflows
+- envs/ contain Dockerfiles for custom environments used in workflows, named flat as `Dockerfile.<env-name>` (not one Dockerfile per subfolder)
 
 All envs should have their own rule in .github/workflows so that they will be updated whenever the relevant dockerfile or any of scripts/* is changed
 All workflows should be registered in .dockstore.yml
@@ -29,7 +29,7 @@ Pulls genotypes for a set of variants and samples out of a Hail VDS stored in GC
   - Reconstructs dense genotypes from the VDS local-allele representation: `local_to_global` for AD, `lgt_to_gt` for GT, then `to_dense_mt`.
   - Exports `GT` to `genotypes.tsv` (the workflow's only output).
 - The variant-string parsing format (`chrom:pos_ref_alt`) is load-bearing — it is parsed both in Python-native code and again via Hail expressions. Keep both parsers in sync if the format changes.
-- Docker image is built from **this repo** (`envs/hail/Dockerfile`, based on `hailgenetics/hail`) and published to Docker Hub as `<DOCKERHUB_USERNAME>/mei-lr-association-hail` (CI names each image `<repo-name>-<env-dir>`). The WDL selects the tag via the `ImageTag` input (defaults to `latest`; pass a 7-char commit SHA to pin a specific build).
+- Docker image is built from **this repo** (`envs/Dockerfile.hail`, based on `hailgenetics/hail`) and published to Docker Hub as `<DOCKERHUB_USERNAME>/mei-lr-association-hail` (CI names each image `<repo-name>-<env-name>`). The WDL selects the tag via the `ImageTag` input (defaults to `latest`; pass a 7-char commit SHA to pin a specific build).
 
 ### 2. SVA_Typer (`workflows/sva_typer.wdl`)
 
@@ -46,7 +46,7 @@ Extracts per-read methylation over insertion sites from a haplotagged PacBio HiF
 - `extract_insertion_methylation.py` (pysam) walks each read's CIGAR to find the large `I` (insertion) op anchored at the locus, extracts the inserted bases, and intersects them with the read's `modified_bases` (5mC `m` / 5hmC `h`). Emits the insertion sequence, haplotype, a per-base methylation string, and per-mod summary stats.
 - Accepted insertion length is per-locus: an `I` op of length `L` qualifies when `min_len - LenTolerance <= L <= max_len + LenTolerance` (`--len-tolerance`, default 100 bp), replacing the old global `--min-ins-len`/`--max-ins-len`.
 - Key correctness invariant: `read.modified_bases` positions and CIGAR query offsets are both in `query_sequence` coordinates (forward-reference oriented), so they intersect directly — use `modified_bases`, **not** `modified_bases_forward`. Probability = `(qual + 0.5) / 256`; `qual == -1` is a no-call.
-- Docker image built from `envs/methylation/Dockerfile` (python + pysam), published to Docker Hub as `<DOCKERHUB_USERNAME>/mei-lr-association-methylation`; WDL selects the tag via the `ImageTag` input (defaults to `latest`). The WDL symlinks `BamIndex` next to `Bam` so pysam finds the `.bai`.
+- Docker image built from `envs/Dockerfile.methylation` (python + pysam), published to Docker Hub as `<DOCKERHUB_USERNAME>/mei-lr-association-methylation`; WDL selects the tag via the `ImageTag` input (defaults to `latest`). The WDL symlinks `BamIndex` next to `Bam` so pysam finds the `.bai`.
 
 ## Common Commands
 
@@ -54,7 +54,7 @@ There is no build/test/lint tooling in this repo — it is WDL + a single Python
 
 Build the Hail Docker image locally (note: Docker context is repo root, Dockerfile path is explicit):
 ```
-docker build -f envs/hail/Dockerfile -t mei-lr-association .
+docker build -f envs/Dockerfile.hail -t mei-lr-association .
 ```
 
 Validate / run WDLs locally (requires womtool/cromwell, not vendored):
@@ -64,7 +64,7 @@ womtool validate workflows/extract_variants.wdl
 
 ## CI
 
-Each env has its own workflow (`.github/workflows/docker-image.yml` for hail, `methylation-docker-image.yml` for methylation) that builds and pushes to Docker Hub on push/PR to `main`/`develop`, **only when `scripts/**` or that env's `Dockerfile` change**. Editing the WDLs alone will not trigger a rebuild. Images are named `<DOCKERHUB_USERNAME>/<repo-name>-<env-dir>` and tagged `latest` + the 7-char commit SHA. Auth uses the `DOCKERHUB_USERNAME` repo **variable** and the `DOCKERHUB_TOKEN` **secret**. Because both workflows watch `scripts/**`, a script change rebuilds both images — the `<env-dir>` suffix keeps their names distinct.
+Each env has its own workflow (`.github/workflows/docker-image.yml` for hail, `methylation-docker-image.yml` for methylation, `r-analysis-docker-image.yml` for r_analysis, `bioinformatics-docker-image.yml` for bioinformatics) that builds and pushes to Docker Hub on push/PR to `main`/`develop`, **only when `scripts/**` or that env's `Dockerfile.<env-name>` change**. Editing the WDLs alone will not trigger a rebuild. Images are named `<DOCKERHUB_USERNAME>/<repo-name>-<env-name>` and tagged `latest` + the 7-char commit SHA. Auth uses the `DOCKERHUB_USERNAME` repo **variable** and the `DOCKERHUB_TOKEN` **secret**. Because all workflows watch `scripts/**`, a script change rebuilds every image — the `<env-name>` suffix keeps their names distinct.
 
 ## Gotchas
 

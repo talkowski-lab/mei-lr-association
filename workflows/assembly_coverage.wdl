@@ -94,7 +94,7 @@ task GetCoverage {
     >>>
 
     runtime {
-        docker: "ayenkin1871/mei-lr-association-coverage:" + ImageTag
+        docker: "ayenkin1871/mei-lr-association-bioinformatics:" + ImageTag
         memory: "8G"
         cpu: 2
         disks: "local-disk " + select_first([DiskGB, auto_disk_size]) + " SSD"

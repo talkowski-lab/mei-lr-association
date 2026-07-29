@@ -53,3 +53,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: AlignDiploidAssemblyToRef
+    primaryDescriptorPath: /workflows/align_diploid_assembly_to_ref.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/

@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'scripts/**'                     # any script baked into the image
-      - 'envs/bioinformatics/Dockerfile' # the env's own Dockerfile
+      - 'scripts/**'                       # any script baked into the image
+      - 'envs/Dockerfile.bioinformatics'    # the env's own Dockerfile
     branches:
       - main
       - develop
   pull_request:
     paths:
       - 'scripts/**'
-      - 'envs/bioinformatics/Dockerfile'
+      - 'envs/Dockerfile.bioinformatics'
     branches:
       - main
 
@@ -36,7 +36,8 @@ jobs:
         id: meta
         run: |
           REPO_NAME=${GITHUB_REPOSITORY##*/}
-          ENV_NAME=$(basename "$(dirname envs/bioinformatics/Dockerfile)")
+          ENV_NAME=$(basename envs/Dockerfile.bioinformatics)
+          ENV_NAME=${ENV_NAME#Dockerfile.}
           echo "IMAGE=${{ vars.DOCKERHUB_USERNAME }}/${REPO_NAME}-${ENV_NAME}" >> "$GITHUB_OUTPUT"
           echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
@@ -44,7 +45,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: envs/bioinformatics/Dockerfile
+          file: envs/Dockerfile.bioinformatics
           push: true
           tags: |
             ${{ steps.meta.outputs.IMAGE }}:latest
