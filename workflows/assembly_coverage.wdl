@@ -97,9 +97,16 @@ task GetCoverage {
             }
             {
                 cur_chrom = $1; pos = $2; footprint = $4; bases = $5
-                gsub(/\^./, "", bases)
-                placeholders = gsub(/[*<>]/, "", bases)
-                d = footprint - placeholders
+                if (footprint == 0) {
+                    # mpileup pads zero-depth sites (from -a/-a -a) with a literal "*" in
+                    # the bases column as a no-data filler, not an empty string -- it is
+                    # not a real deletion placeholder, so it must not be counted here.
+                    d = 0
+                } else {
+                    gsub(/\^./, "", bases)
+                    placeholders = gsub(/[*<>]/, "", bases)
+                    d = footprint - placeholders
+                }
 
                 if (!first && cur_chrom == chrom && d == depth && footprint == fdepth && pos == end + 1) {
                     end = pos
