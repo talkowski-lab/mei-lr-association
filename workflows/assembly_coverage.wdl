@@ -1,6 +1,6 @@
 version 1.0
 
-## Computes per-base coverage across an assembly-to-reference alignment BAM
+## Computes per-base coverage across assembly-to-reference alignment BAMs
 ## (e.g. contigs aligned to the reference with minimap2 asm5), reporting two
 ## depths side by side so gaps vs. deletions can be told apart downstream:
 ##   - `depth`:           count of reads with an actual aligned base at this
@@ -42,27 +42,44 @@ version 1.0
 ## Without Intervals, coverage is reported genome-wide (note: the per-base
 ## pileup then scales with reference length, not BAM size -- size DiskGB
 ## accordingly).
+##
+## Takes one BAM per haplotype of a diploid assembly and runs GetCoverage on
+## each independently (concurrently under Cromwell, same as
+## AlignDiploidAssemblyToRef), since haplotype coverage tables are consumed
+## separately downstream.
 
 workflow AssemblyCoverage {
     input {
-        File Bam
-        File BamIndex
+        File AsmBam1
+        File AsmBamIndex1
+        File AsmBam2
+        File AsmBamIndex2
         File? Intervals
         String Prefix
         String ImageTag = "latest"
     }
 
-    call GetCoverage {
+    call GetCoverage as GetCoverage1 {
         input:
-            Bam = Bam,
-            BamIndex = BamIndex,
+            Bam = AsmBam1,
+            BamIndex = AsmBamIndex1,
             Intervals = Intervals,
-            Prefix = Prefix,
+            Prefix = Prefix + ".hap1",
+            ImageTag = ImageTag
+    }
+
+    call GetCoverage as GetCoverage2 {
+        input:
+            Bam = AsmBam2,
+            BamIndex = AsmBamIndex2,
+            Intervals = Intervals,
+            Prefix = Prefix + ".hap2",
             ImageTag = ImageTag
     }
 
     output {
-        File CoverageTable = GetCoverage.CoverageTable
+        File CoverageTable1 = GetCoverage1.CoverageTable
+        File CoverageTable2 = GetCoverage2.CoverageTable
     }
 }
 
