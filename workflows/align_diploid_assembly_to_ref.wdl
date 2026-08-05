@@ -19,7 +19,7 @@ workflow AlignDiploidAssemblyToRef {
         input:
             Contigs = Hap1Contigs,
             Reference = Reference,
-            Prefix = Prefix + ".hap1",
+            Prefix = Prefix + "-asm_h1.minimap2",
             MinimapPreset = MinimapPreset,
             ImageTag = ImageTag
     }
@@ -28,7 +28,7 @@ workflow AlignDiploidAssemblyToRef {
         input:
             Contigs = Hap2Contigs,
             Reference = Reference,
-            Prefix = Prefix + ".hap2",
+            Prefix = Prefix + "-asm_h2.minimap2",
             MinimapPreset = MinimapPreset,
             ImageTag = ImageTag
     }
