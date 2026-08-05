@@ -57,20 +57,22 @@ cov_table2 <- hap2_cov_table %>%
 
 bad1 <- cov_table1 %>% 
   group_by(sva_id) %>%
-  filter(any(footprint_depth != 1) | is.na(footprint_depth)) %>%
+  # filter(any(footprint_depth != 1) | is.na(footprint_depth)) %>%
   mutate(mark = case_when(
     any(footprint_depth == 0) ~ "Missing",
     all(footprint_depth > 1) ~ "Remap",
+    all(footprint_depth == 1) ~ "Ok",
     .default = "Misc"
   ))
 
 
 bad2 <- cov_table2 %>% 
   group_by(sva_id) %>%
-  filter(any(footprint_depth != 1) | is.na(footprint_depth)) %>%
+  # filter(any(footprint_depth != 1) | is.na(footprint_depth)) %>%
   mutate(mark = case_when(
     any(footprint_depth == 0) ~ "Missing",
     all(footprint_depth > 1) ~ "Remap",
+    all(footprint_depth == 1) ~ "Ok",
     .default = "Misc"
   ))
 
@@ -118,8 +120,8 @@ flag_summ <- ref_sva_bed_df %>%
   cross_join(tibble(hap=c("h1", "h2"))) %>%
   left_join(n_flag) %>%
   left_join(asm_bad_annot) %>%
-  left_join(rep_coord_flag_df) %>%
-  mutate(across(ends_with("flag"), ~ replace_na(.x, "Ok")))
+  left_join(rep_coord_flag_df)# %>%
+#  mutate(across(ends_with("flag"), ~ replace_na(.x, "Ok")))
 
 prefix <- p$prefix
 
