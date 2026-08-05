@@ -17,12 +17,12 @@ p <- arg_parser("Program to annotate ref SVAs with Flags for Quality") %>%
   parse_args()
 
 
-ref_sva_bed_df <- read_delim(p$sva_ref_bed, col_names=c("chrom", "start", "end", "subfamily", "strand", "score", "sva_id"))
+ref_sva_bed_df <- read_delim(p$sva_ref_bed, col_names=c("chrom", "start", "end", "subfamily", "strand", "score", "sva_id"), delim="\t")
 sva_ref_seqs <- readDNAStringSet(p$sva_ref_seqs)
-hap1_cov_table <- read_delim(p$sva_ref_cov_table_hap1)
-hap2_cov_table <- read_delim(p$sva_ref_cov_table_hap2)
+hap1_cov_table <- read_delim(p$sva_ref_cov_table_hap1, delim="\t")
+hap2_cov_table <- read_delim(p$sva_ref_cov_table_hap2, delim="\t")
 
-rep_coords <- read_delim(p$sva_ref_rep_coords)
+rep_coords <- read_delim(p$sva_ref_rep_coords, delim="\t")
 
 
 # Get the sequence info on the extracted ref sequences

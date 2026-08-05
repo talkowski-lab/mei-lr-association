@@ -46,7 +46,7 @@ Extracts per-read methylation over insertion sites from a haplotagged PacBio HiF
 - `extract_insertion_methylation.py` (pysam) walks each read's CIGAR to find the large `I` (insertion) op anchored at the locus, extracts the inserted bases, and intersects them with the read's `modified_bases` (5mC `m` / 5hmC `h`). Emits the insertion sequence, haplotype, a per-base methylation string, and per-mod summary stats.
 - Accepted insertion length is per-locus: an `I` op of length `L` qualifies when `min_len - LenTolerance <= L <= max_len + LenTolerance` (`--len-tolerance`, default 100 bp), replacing the old global `--min-ins-len`/`--max-ins-len`.
 - Key correctness invariant: `read.modified_bases` positions and CIGAR query offsets are both in `query_sequence` coordinates (forward-reference oriented), so they intersect directly — use `modified_bases`, **not** `modified_bases_forward`. Probability = `(qual + 0.5) / 256`; `qual == -1` is a no-call.
-- Docker image built from `envs/Dockerfile.methylation` (python + pysam), published to Docker Hub as `<DOCKERHUB_USERNAME>/mei-lr-association-methylation`; WDL selects the tag via the `ImageTag` input (defaults to `latest`). The WDL symlinks `BamIndex` next to `Bam` so pysam finds the `.bai`.
+- Docker image built from `envs/Dockerfile.python_general` (a general-purpose Python env — python + pysam + pandas + biopython — also used by other pure-Python scripts like `combine_fastas.py`), published to Docker Hub as `<DOCKERHUB_USERNAME>/mei-lr-association-python_general`; WDL selects the tag via the `ImageTag` input (defaults to `latest`). The WDL symlinks `BamIndex` next to `Bam` so pysam finds the `.bai`.
 
 ## Common Commands
 
@@ -64,7 +64,7 @@ womtool validate workflows/extract_variants.wdl
 
 ## CI
 
-Each env has its own workflow (`.github/workflows/docker-image.yml` for hail, `methylation-docker-image.yml` for methylation, `r-analysis-docker-image.yml` for r_analysis, `bioinformatics-docker-image.yml` for bioinformatics) that builds and pushes to Docker Hub on push/PR to `main`/`develop`, **only when `scripts/**` or that env's `Dockerfile.<env-name>` change**. Editing the WDLs alone will not trigger a rebuild. Images are named `<DOCKERHUB_USERNAME>/<repo-name>-<env-name>` and tagged `latest` + the 7-char commit SHA. Auth uses the `DOCKERHUB_USERNAME` repo **variable** and the `DOCKERHUB_TOKEN` **secret**. Because all workflows watch `scripts/**`, a script change rebuilds every image — the `<env-name>` suffix keeps their names distinct.
+Each env has its own workflow (`.github/workflows/docker-image.yml` for hail, `python-general-docker-image.yml` for python_general, `r-analysis-docker-image.yml` for r_analysis, `bioinformatics-docker-image.yml` for bioinformatics) that builds and pushes to Docker Hub on push/PR to `main`/`develop`, **only when `scripts/**` or that env's `Dockerfile.<env-name>` change**. Editing the WDLs alone will not trigger a rebuild. Images are named `<DOCKERHUB_USERNAME>/<repo-name>-<env-name>` and tagged `latest` + the 7-char commit SHA. Auth uses the `DOCKERHUB_USERNAME` repo **variable** and the `DOCKERHUB_TOKEN` **secret**. Because all workflows watch `scripts/**`, a script change rebuilds every image — the `<env-name>` suffix keeps their names distinct.
 
 ## Gotchas
 

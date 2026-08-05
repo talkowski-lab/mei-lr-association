@@ -1,9 +1,35 @@
 ## General-purpose bioinformatics environment shared by workflows that just need
-## standard command-line tools (samtools, bedtools, minimap2, bcftools, tabix)
-## rather than a bespoke script-driven pipeline.
+## standard command-line tools (samtools, bedtools, minimap2, bcftools, tabix,
+## seqtk) rather than a bespoke script-driven pipeline.
 FROM debian:bookworm-slim
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        samtools bcftools bedtools tabix minimap2 \
-    && rm -rf /var/lib/apt/lists/*
+        bedtools tabix minimap2 seqtk python3 python3-pip \
+        build-essential zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev libssl-dev libncurses-dev curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir --break-system-packages biopython
+
+## Build samtools/bcftools from source rather than off the Debian bookworm
+## package (1.13): the ExtractSeq task in seq_extract_from_asm.wdl needs
+## `samtools consensus --regions-file`, only added in samtools 1.24.
+ARG HTS_VERSION=1.24
+RUN cd /tmp \
+    && for pkg in htslib samtools bcftools; do \
+        curl -sSL "https://github.com/samtools/${pkg}/releases/download/${HTS_VERSION}/${pkg}-${HTS_VERSION}.tar.bz2" | tar xj; \
+    done \
+    && cd /tmp/htslib-${HTS_VERSION} && ./configure --enable-libcurl && make -j"$(nproc)" && make install \
+    && cd /tmp/samtools-${HTS_VERSION} && ./configure --with-htslib=system && make -j"$(nproc)" && make install \
+    && cd /tmp/bcftools-${HTS_VERSION} && ./configure --with-htslib=system && make -j"$(nproc)" && make install \
+    && ldconfig \
+    && rm -rf /tmp/htslib-${HTS_VERSION} /tmp/samtools-${HTS_VERSION} /tmp/bcftools-${HTS_VERSION}
+
+## gcloud/gsutil/bq CLIs, for tasks that need to shell out to GCS directly
+## (e.g. listing/copying gs:// paths) rather than relying on WDL File/String
+## localization alone. Installed via the standalone SDK tarball rather than
+## apt's google-cloud-cli package, since that requires setting up Google's apt
+## repo/signing key first.
+RUN curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt
+ENV PATH="/opt/google-cloud-sdk/bin:${PATH}"
+
 COPY scripts/ ./scripts/
 CMD ["bash"]

@@ -1,18 +1,18 @@
-name: Methylation Docker Image CI
+name: Python General Docker Image CI
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - 'scripts/**'                    # any script baked into the image
-      - 'envs/Dockerfile.methylation'    # the env's own Dockerfile
+      - 'scripts/**'                      # any script baked into the image
+      - 'envs/Dockerfile.python_general'  # the env's own Dockerfile
     branches:
       - main
       - develop
   pull_request:
     paths:
       - 'scripts/**'
-      - 'envs/Dockerfile.methylation'
+      - 'envs/Dockerfile.python_general'
     branches:
       - main
 
@@ -36,7 +36,7 @@ jobs:
         id: meta
         run: |
           REPO_NAME=${GITHUB_REPOSITORY##*/}
-          ENV_NAME=$(basename envs/Dockerfile.methylation)
+          ENV_NAME=$(basename envs/Dockerfile.python_general)
           ENV_NAME=${ENV_NAME#Dockerfile.}
           echo "IMAGE=${{ vars.DOCKERHUB_USERNAME }}/${REPO_NAME}-${ENV_NAME}" >> "$GITHUB_OUTPUT"
           echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
@@ -45,7 +45,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: envs/Dockerfile.methylation
+          file: envs/Dockerfile.python_general
           push: true
           tags: |
             ${{ steps.meta.outputs.IMAGE }}:latest

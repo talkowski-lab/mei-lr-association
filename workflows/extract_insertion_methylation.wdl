@@ -64,7 +64,7 @@ task ExtractMethylation {
     >>>
 
     runtime {
-        docker: "ayenkin1871/mei-lr-association-methylation:" + ImageTag
+        docker: "ayenkin1871/mei-lr-association-python_general:" + ImageTag
         memory: "16G"
         cpu: 4
         disks: "local-disk " + disk_size + " SSD"
