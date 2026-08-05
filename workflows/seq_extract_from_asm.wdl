@@ -2,10 +2,10 @@ version 1.0
 
 workflow ExtractSeqFromASM {
   input {
-    String hap1_bam
-    String hap1_bam_index
-    String hap2_bam
-    String hap2_bam_index
+    File hap1_bam
+    File hap1_bam_index
+    File hap2_bam
+    File hap2_bam_index
     File region_file
     String Prefix
     String ImageTag = "latest"
@@ -34,21 +34,23 @@ workflow ExtractSeqFromASM {
 task ExtractSeq {
   input {
     File region_file
-    String input_file
-    String input_file_index
+    File input_file
+    File input_file_index
     String ImageTag = "latest"
-    Int DiskGB = 20
+    Int? DiskGB
   }
 
   String name = basename(input_file, ".bam")
   String outfile = basename(input_file, ".bam") + "_sva_seq.fa"
 
-  # htslib's "##idx##" syntax pairs a remote BAM with an explicit index path --
-  # input_file/input_file_index are gs:// URIs (not localized), so the index
-  # can't be found by the usual same-directory/.bai convention.
-  String bam_with_idx = input_file + "##idx##" + input_file_index
+  Int auto_disk_size = ceil(size(input_file, "GB") * 2) + 20
 
   command <<<
+    set -euo pipefail
+
+    ln -s ~{input_file} input.bam
+    ln -s ~{input_file_index} input.bam.bai
+
     fwd_file="~{name}_fwd.fasta"
     rev_file="~{name}_rev.fasta"
 
@@ -70,12 +72,10 @@ task ExtractSeq {
       '
     }
 
-    export GCS_OAUTH_TOKEN=`gcloud auth application-default print-access-token`
-
-    samtools consensus --regions-file fwd_regions.bed -m simple "~{bam_with_idx}" \
+    samtools consensus --regions-file fwd_regions.bed -m simple input.bam \
       | rename_headers fwd_ids.txt > $fwd_file
 
-    samtools consensus --regions-file rev_regions.bed -m simple "~{bam_with_idx}" \
+    samtools consensus --regions-file rev_regions.bed -m simple input.bam \
       | rename_headers rev_ids.txt > $rev_file
 
     python3 /scripts/combine_fastas.py $fwd_file <(seqtk seq -r $rev_file) > ~{outfile}
@@ -95,7 +95,7 @@ task ExtractSeq {
     docker: "ayenkin1871/mei-lr-association-bioinformatics:" + ImageTag
     cpu: 4
     memory: "30 GiB"
-    disks: "local-disk " + DiskGB + " HDD"
+    disks: "local-disk " + select_first([DiskGB, auto_disk_size]) + " HDD"
     bootDiskSizeGb: 10
     preemptible: 3
     maxRetries: 2
