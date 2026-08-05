@@ -1,7 +1,9 @@
-## Environment for rendering ad-hoc Rmarkdown reports.
-## rocker/verse ships R, tidyverse, pandoc, and TinyTeX (for PDF output) already.
+## Environment for rendering ad-hoc Rmarkdown reports and running ad-hoc R
+## analysis scripts (e.g. ref_sva_qc.R). rocker/verse ships R, tidyverse,
+## pandoc, and TinyTeX (for PDF output) already.
 FROM rocker/verse:4.4.1
-RUN R -e "install.packages(c('optparse', 'jsonlite', 'AnVIL', 'AnVILGCP', 'data.table', 'ggplot2', 'ggthemes', 'glue'), repos = 'https://cloud.r-project.org')"
+RUN R -e "install.packages(c('optparse', 'argparser', 'jsonlite', 'AnVIL', 'AnVILGCP', 'data.table', 'ggplot2', 'ggthemes', 'glue', 'BiocManager'), repos = 'https://cloud.r-project.org')" \
+    && R -e "BiocManager::install('Biostrings', update = FALSE, ask = FALSE)"
 
 ## Build samtools/bcftools from source with --enable-libcurl so htslib's remote
 ## file support can read gs:// (and s3://) URLs directly, not just local paths.

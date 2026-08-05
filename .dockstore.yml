@@ -62,3 +62,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: RefSVAQc
+    primaryDescriptorPath: /workflows/ref_sva_qc.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
