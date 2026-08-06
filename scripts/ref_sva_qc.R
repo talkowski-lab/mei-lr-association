@@ -59,9 +59,10 @@ bad1 <- cov_table1 %>%
   group_by(sva_id) %>%
   # filter(any(footprint_depth != 1) | is.na(footprint_depth)) %>%
   mutate(mark = case_when(
-    any(footprint_depth == 0) ~ "Missing",
-    all(footprint_depth > 1) ~ "Remap",
     all(footprint_depth == 1) ~ "Ok",
+    all(footprint_depth == 0) ~ "Tot_missing",
+    all(footprint_depth == 2) ~ "Tot_double",
+    any(footprint_depth == 0) ~ "Partial_missing",
     .default = "Misc"
   ))
 
@@ -70,9 +71,10 @@ bad2 <- cov_table2 %>%
   group_by(sva_id) %>%
   # filter(any(footprint_depth != 1) | is.na(footprint_depth)) %>%
   mutate(mark = case_when(
-    any(footprint_depth == 0) ~ "Missing",
-    all(footprint_depth > 1) ~ "Remap",
     all(footprint_depth == 1) ~ "Ok",
+    all(footprint_depth == 0) ~ "Tot_missing",
+    all(footprint_depth == 2) ~ "Tot_double",
+    any(footprint_depth == 0) ~ "Partial_missing",
     .default = "Misc"
   ))
 
@@ -127,8 +129,9 @@ prefix <- p$prefix
 
 flag_summ %>%
   group_by(sva_id) %>%
-  filter(any(asm_flag %in% c("Remap", "Misc"))) %>%
+  filter(length(intersect(asm_flag, c("Tot_missing", "Tot_double"))) == 2) %>%
   select(chrom, start, end, sva_id) %>%
+  distinct() %>%
   write_delim(glue("{prefix}_remap_regions.bed"), delim="\t", col_names=FALSE)
 
 flag_summ %>%
