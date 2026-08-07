@@ -37,15 +37,6 @@ workflows:
         - /.*/
 
   - subclass: WDL
-    name: ConcatenateColumnFiles
-    primaryDescriptorPath: /workflows/concat_files.wdl
-    filters:
-      branches:
-        - main
-      tags:
-        - /.*/
-
-  - subclass: WDL
     name: RenderRmarkdownReport
     primaryDescriptorPath: /workflows/render_rmarkdown.wdl
     filters:
@@ -75,6 +66,15 @@ workflows:
   - subclass: WDL
     name: RefSVAQc
     primaryDescriptorPath: /workflows/ref_sva_qc.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
+
+  - subclass: WDL
+    name: ConcatenateAndProcessFiles
+    primaryDescriptorPath: /workflows/concat_files_with_script.wdl
     filters:
       branches:
         - main
