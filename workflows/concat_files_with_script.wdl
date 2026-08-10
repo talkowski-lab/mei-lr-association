@@ -18,6 +18,18 @@ version 1.0
 ##   Ids        = this.samples.sample_id         (Array[String], optional)
 ## If Ids is omitted while AddIdColumn is set, each row is tagged with the
 ## basename of its (post-script) source file instead.
+##
+## BatchSize is optional and off by default. Cromwell localizes every File in
+## InputFiles before a task's command even starts, so with thousands of small
+## files, one giant ConcatenateFiles call pays for all of that localization
+## serially on a single VM. If BatchSize is set, InputFiles is instead chunked
+## into groups of that size, each chunk is localized/concatenated by its own
+## ConcatenateFiles call (so localization is spread across many concurrent
+## tasks instead of one), and the resulting per-batch files are concatenated
+## again by a final ConcatenateFiles call (which is where GzipOutput is
+## actually applied -- per-batch outputs are always left ungzipped so this
+## final call can still parse them as text). If BatchSize is unset, this
+## collapses back to the original single-call behavior with no scatter at all.
 
 workflow ConcatenateAndProcessFiles {
   input {
@@ -32,25 +44,91 @@ workflow ConcatenateAndProcessFiles {
     String Delimiter = "\t"
     String OutputName = "concatenated.tsv"
     String ImageTag = "latest"
+    Int? BatchSize
   }
 
-  call ConcatenateFiles {
-    input:
-      InputFiles = InputFiles,
-      HasHeader = HasHeader,
-      GzipOutput = GzipOutput,
-      RemoteScript = RemoteScript,
-      EmbeddedScriptPath = EmbeddedScriptPath,
-      AddIdColumn = AddIdColumn,
-      Ids = Ids,
-      IdColumnName = IdColumnName,
-      Delimiter = Delimiter,
-      OutputName = OutputName,
-      ImageTag = ImageTag
+  Int total_files = length(InputFiles)
+
+  if (defined(BatchSize)) {
+    Int effective_batch_size = select_first([BatchSize])
+    Int n_batches = (total_files + effective_batch_size - 1) / effective_batch_size
+
+    scatter (batch_idx in range(n_batches)) {
+      # No slicing operator in WDL 1.0, so InputFiles[batch_idx*size : ...] isn't
+      # available -- gather this batch's indices via select_all over a masked
+      # range, then gather the actual Files (and Ids, if given) by those indices.
+      # None of this touches file *contents*, so nothing gets localized here --
+      # only the ConcatenateBatch call below localizes anything, and only the
+      # ~effective_batch_size files that belong to its one batch.
+      scatter (file_pos in range(total_files)) {
+        # WDL 1.0 has no `None` literal, so an if-block (rather than a
+        # then/else ternary) is the portable way to produce an Int? that's
+        # only set when file_pos falls in this batch.
+        if (file_pos >= batch_idx * effective_batch_size && file_pos < (batch_idx + 1) * effective_batch_size) {
+          Int keep_pos = file_pos
+        }
+      }
+      Array[Int] batch_indices = select_all(keep_pos)
+
+      scatter (idx in batch_indices) {
+        File batch_file = InputFiles[idx]
+      }
+
+      if (defined(Ids)) {
+        scatter (idx in batch_indices) {
+          String batch_id_elem = select_first([Ids])[idx]
+        }
+      }
+
+      call ConcatenateFiles as ConcatenateBatch {
+        input:
+          InputFiles = batch_file,
+          HasHeader = HasHeader,
+          GzipOutput = false,
+          RemoteScript = RemoteScript,
+          EmbeddedScriptPath = EmbeddedScriptPath,
+          AddIdColumn = AddIdColumn,
+          Ids = batch_id_elem,
+          IdColumnName = IdColumnName,
+          Delimiter = Delimiter,
+          OutputName = "batch_" + batch_idx + ".txt",
+          ImageTag = ImageTag
+      }
+    }
+
+    # Batch outputs already have (at most) one header each and their rows are
+    # already ID-tagged, so no script/ID-column options are passed here --
+    # this call only re-applies header de-dup across batches and GzipOutput.
+    call ConcatenateFiles as MergeBatches {
+      input:
+        InputFiles = ConcatenateBatch.ConcatenatedFile,
+        HasHeader = HasHeader,
+        GzipOutput = GzipOutput,
+        Delimiter = Delimiter,
+        OutputName = OutputName,
+        ImageTag = ImageTag
+    }
+  }
+
+  if (!defined(BatchSize)) {
+    call ConcatenateFiles as ConcatenateSingle {
+      input:
+        InputFiles = InputFiles,
+        HasHeader = HasHeader,
+        GzipOutput = GzipOutput,
+        RemoteScript = RemoteScript,
+        EmbeddedScriptPath = EmbeddedScriptPath,
+        AddIdColumn = AddIdColumn,
+        Ids = Ids,
+        IdColumnName = IdColumnName,
+        Delimiter = Delimiter,
+        OutputName = OutputName,
+        ImageTag = ImageTag
+    }
   }
 
   output {
-    File ConcatenatedFile = ConcatenateFiles.ConcatenatedFile
+    File ConcatenatedFile = select_first([MergeBatches.ConcatenatedFile, ConcatenateSingle.ConcatenatedFile])
   }
 }
 
@@ -72,8 +150,9 @@ task ConcatenateFiles {
     Int? DiskGB
   }
 
-  # Manifest files avoid any shell-quoting issues with long/odd file paths.
-  File manifest = write_lines(InputFiles)
+  # Ids is Array[String] (never File), so it's safe to write out here regardless
+  # of localization timing. InputFiles is NOT handled this way -- see the manifest
+  # built inline in the command block below, and the comment there for why.
   File id_manifest = write_lines(select_first([Ids, []]))
 
   String FinalOutputName = if GzipOutput then OutputName + ".gz" else OutputName
@@ -96,12 +175,22 @@ task ConcatenateFiles {
     export DELIMITER='~{Delimiter}'
     export OUT_PATH='~{OutputName}'
 
+    # Built inline (rather than via a `File manifest = write_lines(InputFiles)`
+    # declaration outside command) so each line is InputFiles' *localized* local
+    # path: a File only gets its Cromwell-localized path substituted when
+    # referenced directly inside the command block, not in declarations
+    # evaluated before it -- same gotcha as the RemoteScript "+" idiom above.
+    cat > input_files_manifest.txt <<'MANIFEST_EOF'
+~{sep="\n" InputFiles}
+MANIFEST_EOF
+
     python3 <<'CODE'
 import csv
 import gzip
 import io
 import os
 import subprocess
+import sys
 
 has_header = os.environ["HAS_HEADER"] == "true"
 gzip_output = os.environ["GZIP_OUTPUT"] == "true"
@@ -112,7 +201,7 @@ remote_script_path = os.environ.get("REMOTE_SCRIPT_PATH") or None
 embedded_script_path = os.environ.get("EMBEDDED_SCRIPT_PATH") or None
 out_path = os.environ["OUT_PATH"]
 
-with open("~{manifest}") as f:
+with open("input_files_manifest.txt") as f:
     files = [line.strip() for line in f if line.strip()]
 
 with open("~{id_manifest}") as f:
@@ -132,12 +221,22 @@ if remote_script_path:
 elif embedded_script_path:
     script_path = embedded_script_path
 
+if script_path is not None:
+    print(f"[debug] preprocessing script: {script_path!r} exists={os.path.isfile(script_path)}", file=sys.stderr)
+else:
+    print("[debug] no preprocessing script set; using file contents as-is", file=sys.stderr)
+
 open_fn = gzip.open if gzip_output else open
 writer = None
 with open_fn(out_path, "wt", newline="") as out_f:
     for i, fp in enumerate(files):
         if script_path is not None:
-            text = subprocess.run([script_path, fp], check=True, capture_output=True).stdout.decode()
+            result = subprocess.run([script_path, fp], capture_output=True)
+            if result.returncode != 0:
+                print(f"[error] {script_path} failed on {fp!r} (exit {result.returncode})", file=sys.stderr)
+                print(result.stderr.decode(errors="replace"), file=sys.stderr)
+                result.check_returncode()
+            text = result.stdout.decode()
         else:
             with open(fp) as in_f:
                 text = in_f.read()
