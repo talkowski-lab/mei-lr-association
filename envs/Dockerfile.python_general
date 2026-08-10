@@ -2,6 +2,6 @@
 ## combine_fastas.py, and other pure-Python scripts). pysam and biopython both ship
 ## manylinux wheels, so no build toolchain is needed.
 FROM python:3.11-slim
-RUN pip install --no-cache-dir pysam pandas biopython
+RUN pip install --no-cache-dir pysam pandas biopython polars numpy scipy
 COPY scripts/ ./scripts/
 CMD ["bash"]

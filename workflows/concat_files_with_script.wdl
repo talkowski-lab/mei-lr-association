@@ -173,7 +173,7 @@ task ConcatenateFiles {
     export ADD_ID_COLUMN='~{AddIdColumn}'
     export ID_COLUMN_NAME='~{IdColumnName}'
     export DELIMITER='~{Delimiter}'
-    export OUT_PATH='~{OutputName}'
+    export OUT_PATH='~{FinalOutputName}'
 
     # Built inline (rather than via a `File manifest = write_lines(InputFiles)`
     # declaration outside command) so each line is InputFiles' *localized* local
@@ -199,7 +199,7 @@ id_col_name = os.environ["ID_COLUMN_NAME"]
 delim = os.environ["DELIMITER"]
 remote_script_path = os.environ.get("REMOTE_SCRIPT_PATH") or None
 embedded_script_path = os.environ.get("EMBEDDED_SCRIPT_PATH") or None
-out_path = os.environ["OUT_PATH"]
+out_path = os.environ["OUT_PATH"]  # already has .gz appended (if any) by the WDL's FinalOutputName
 
 with open("input_files_manifest.txt") as f:
     files = [line.strip() for line in f if line.strip()]
@@ -226,9 +226,11 @@ if script_path is not None:
 else:
     print("[debug] no preprocessing script set; using file contents as-is", file=sys.stderr)
 
-open_fn = gzip.open if gzip_output else open
+# compresslevel=6 to match the standalone gzip CLI's default -- gzip.open()'s
+# own default (9, max compression) is meaningfully slower for little ratio gain.
+out_f_cm = gzip.open(out_path, "wt", newline="", compresslevel=6) if gzip_output else open(out_path, "wt", newline="")
 writer = None
-with open_fn(out_path, "wt", newline="") as out_f:
+with out_f_cm as out_f:
     for i, fp in enumerate(files):
         if script_path is not None:
             result = subprocess.run([script_path, fp], capture_output=True)
