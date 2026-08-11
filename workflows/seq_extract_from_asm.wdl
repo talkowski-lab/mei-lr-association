@@ -51,13 +51,11 @@ task ExtractSeq {
     ln -s ~{input_file} input.bam
     ln -s ~{input_file_index} input.bam.bai
 
-    fwd_file="~{name}_fwd.fasta"
-    rev_file="~{name}_rev.fasta"
-
     awk '$5 == "+"' ~{region_file} | cut -f 1-3 > fwd_regions.bed
-    awk '$5 == "+"' ~{region_file} | cut -f 7 > fwd_ids.txt
+    awk -v OFS="\t" '$5=="+" {print $1":"($2+1)"-"$3, $7}' ~{region_file} > fwd_idmap.txt
+
     awk '$5 == "-"' ~{region_file} | cut -f 1-3 > rev_regions.bed
-    awk '$5 == "-"' ~{region_file} | cut -f 7 > rev_ids.txt
+    awk -v OFS="\t" '$5=="-" {print $1":"($2+1)"-"$3, $7}' ~{region_file} > rev_idmap.txt
 
     # One samtools consensus call per strand (instead of one per region) via
     # --regions-file (samtools >= 1.24); each output record's header is renamed
@@ -72,16 +70,16 @@ task ExtractSeq {
       '
     }
 
-    samtools consensus --regions-file fwd_regions.bed -m simple input.bam \
-      | rename_headers fwd_ids.txt > $fwd_file
+    samtools consensus --regions-file fwd_regions.bed -m simple input.bam > fwd.fasta 
+    seqkit replace -p '(.+)' -r '{kv}' -k fwd_idmap.txt fwd.fasta | seqkit replace -p '^' -r '~{name}_' > fwd_renamed.fasta
 
-    samtools consensus --regions-file rev_regions.bed -m simple input.bam \
-      | rename_headers rev_ids.txt > $rev_file
+    samtools consensus --regions-file rev_regions.bed -m simple input.bam > rev.fasta 
+    seqkit replace -p '(.+)' -r '{kv}' -k rev_idmap.txt rev.fasta | seqkit replace -p '^' -r '~{name}_' > rev_renamed.fasta
 
-    python3 /scripts/combine_fastas.py $fwd_file <(seqtk seq -r $rev_file) > ~{outfile}
+    python3 /scripts/combine_fastas.py fwd_renamed.fasta <(seqtk seq -r rev_renamed.fasta) > ~{outfile}
 
     if [ ! -s ~{outfile} ]; then
-      echo "Error: No sequenes were extracted" >&2
+      echo "Error: No sequences were extracted" >&2
       exit 1
     fi
 
@@ -93,8 +91,8 @@ task ExtractSeq {
 
   runtime {
     docker: "ayenkin1871/mei-lr-association-bioinformatics:" + ImageTag
-    cpu: 4
-    memory: "30 GiB"
+    cpu: 2
+    memory: "8 GiB"
     disks: "local-disk " + select_first([DiskGB, auto_disk_size]) + " HDD"
     bootDiskSizeGb: 10
     preemptible: 3

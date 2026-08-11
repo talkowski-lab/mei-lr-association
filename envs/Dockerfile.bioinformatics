@@ -31,5 +31,13 @@ RUN cd /tmp \
 RUN curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt
 ENV PATH="/opt/google-cloud-sdk/bin:${PATH}"
 
+## seqkit, for FASTA/FASTQ manipulation tasks (stats, subseq, grep, etc.).
+## Installed from the prebuilt release binary (bioinf.shenwei.me/seqkit/download)
+## rather than apt, for a pinned, known-good version. /usr/local/bin is already
+## on PATH, so no ENV update needed here (unlike the gcloud SDK above).
+ARG SEQKIT_VERSION=2.13.0
+RUN curl -sSL "https://github.com/shenwei356/seqkit/releases/download/v${SEQKIT_VERSION}/seqkit_linux_amd64.tar.gz" \
+    | tar xz -C /usr/local/bin seqkit
+
 COPY scripts/ ./scripts/
 CMD ["bash"]
