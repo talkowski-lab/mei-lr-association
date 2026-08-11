@@ -155,7 +155,12 @@ task ConcatenateFiles {
   # built inline in the command block below, and the comment there for why.
   File id_manifest = write_lines(select_first([Ids, []]))
 
-  String FinalOutputName = if GzipOutput then OutputName + ".gz" else OutputName
+  # Only append .gz if OutputName doesn't already end with it, so callers who
+  # already anticipated gzipping (e.g. OutputName = "concatenated.tsv.gz")
+  # don't end up with a doubled ".gz.gz".
+  Boolean output_already_has_gz_suffix = sub(OutputName, "\\.gz$", "") != OutputName
+  String FinalOutputName = if GzipOutput && !output_already_has_gz_suffix then OutputName + ".gz" else OutputName
+  Boolean AppendedGzSuffix = FinalOutputName != OutputName
 
   Int auto_disk_size = ceil((size(InputFiles, "GiB") + size(RemoteScript, "GiB")) * 3) + 10
 
@@ -174,6 +179,8 @@ task ConcatenateFiles {
     export ID_COLUMN_NAME='~{IdColumnName}'
     export DELIMITER='~{Delimiter}'
     export OUT_PATH='~{FinalOutputName}'
+    export ORIGINAL_OUTPUT_NAME='~{OutputName}'
+    export APPENDED_GZ_SUFFIX='~{AppendedGzSuffix}'
 
     # Built inline (rather than via a `File manifest = write_lines(InputFiles)`
     # declaration outside command) so each line is InputFiles' *localized* local
@@ -200,6 +207,13 @@ delim = os.environ["DELIMITER"]
 remote_script_path = os.environ.get("REMOTE_SCRIPT_PATH") or None
 embedded_script_path = os.environ.get("EMBEDDED_SCRIPT_PATH") or None
 out_path = os.environ["OUT_PATH"]  # already has .gz appended (if any) by the WDL's FinalOutputName
+
+if os.environ["APPENDED_GZ_SUFFIX"] == "true":
+    print(
+        f"[info] GzipOutput is set and OutputName ({os.environ['ORIGINAL_OUTPUT_NAME']!r}) "
+        f"had no .gz suffix -- appended one; writing to {out_path!r} instead",
+        file=sys.stderr,
+    )
 
 with open("input_files_manifest.txt") as f:
     files = [line.strip() for line in f if line.strip()]
