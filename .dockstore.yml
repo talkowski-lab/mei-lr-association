@@ -80,3 +80,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: ParseLongestPureSegment
+    primaryDescriptorPath: /workflows/parse_longest_pure_segment.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
