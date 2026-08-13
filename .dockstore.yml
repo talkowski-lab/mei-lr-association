@@ -107,3 +107,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: FilterMEIVCF
+    primaryDescriptorPath: /workflows/filter_mei_vcf.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
