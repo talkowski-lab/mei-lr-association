@@ -7,12 +7,12 @@ library(argparser)
 
 # Parse arguments
 argv <- arg_parser("Process reference SVAs to incorporate filters and export MED data") %>%
-  add_argument("--ref-sva-length-table") %>%
-  add_argument("--ref-sva-lps-table") %>%
-  add_argument("--ref-sva-flag-table") %>%
-  add_argument("--ref-sva-bed") %>%
-  add_argument("--sv-vcf") %>%
-  add_argument("--l1meaid-table") %>%
+  add_argument("--ref-sva-length-table", "table with reference SVA lengths") %>%
+  add_argument("--ref-sva-lps-table", "table with reference SVA longest purse segment lenghts") %>%
+  add_argument("--ref-sva-flag-table", "table with SVA reference flags") %>%
+  add_argument("--ref-sva-bed", "bed file with locations of reference SVAs") %>%
+  add_argument("--sv-vcf", "URI of vcf with SVs (importantly deletions)") %>%
+  add_argument("--l1meaid-table", "INTACT MEI output containing rMEI information") %>%
   parse_args()
 
 
