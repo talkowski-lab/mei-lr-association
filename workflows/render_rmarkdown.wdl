@@ -70,8 +70,6 @@ task RenderReport {
                else "out"
   String OutputFile = "report." + Ext
 
-  File data_manifest = write_lines(InputData)
-  File r_scripts_manifest = write_lines(RScripts)
   File params_json = write_json(RenderParams)
 
   Int auto_disk_gb = ceil(size(RmdFile, "GB") + size(InputData, "GB") + size(RScripts, "GB")) * 2 + 20
@@ -86,20 +84,16 @@ task RenderReport {
 
     cp ~{RmdFile} report.Rmd
 
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
+    # write_lines(Array[File]) can emit original (e.g. gs://) paths instead of the
+    # localized on-VM paths, so the arrays are interpolated directly here instead --
+    # that's the one substitution Cromwell always resolves to the localized path.
+    for f in ~{sep=" " InputData}; do
         cp "$f" .
-    done < ~{data_manifest}
+    done
 
-    # RScripts is otherwise only read via the write_lines() manifest above, which
-    # writes paths without forcing localization on all backends -- interpolate the
-    # array directly (no-op) so Cromwell localizes every file before the command runs.
-    : ~{sep=" " RScripts}
-
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
+    for f in ~{sep=" " RScripts}; do
         cp "$f" .
-    done < ~{r_scripts_manifest}
+    done
 
     Rscript /scripts/render_rmarkdown.R \
         --rmd report.Rmd \
