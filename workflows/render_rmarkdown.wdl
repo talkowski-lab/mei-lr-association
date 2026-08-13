@@ -81,12 +81,20 @@ task RenderReport {
 
     mkdir -p ~{FiguresDir} ~{TablesDir}
 
+    export FIGURES_DIR=~{FiguresDir}
+    export TABLES_DIR=~{TablesDir}
+
     cp ~{RmdFile} report.Rmd
 
     while IFS= read -r f; do
         [ -z "$f" ] && continue
         cp "$f" .
     done < ~{data_manifest}
+
+    # RScripts is otherwise only read via the write_lines() manifest above, which
+    # writes paths without forcing localization on all backends -- interpolate the
+    # array directly (no-op) so Cromwell localizes every file before the command runs.
+    : ~{sep=" " RScripts}
 
     while IFS= read -r f; do
         [ -z "$f" ] && continue
