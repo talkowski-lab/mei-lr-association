@@ -205,14 +205,14 @@ med_ref_sva_length_lps_perindiv <- ref_sva_length_lps_df_with_dev %>%
   filter(sva_id %in% med_gt_tidy$sva_id) %>%
   group_by(indiv, sva_id) %>%
   summarize(
-    tot_length_lps_hexamer = sum(length_lps_hexamer), 
-    tot_length_lps_VNTR_1 = sum(length_lps_VNTR_1), 
-    tot_length_lps_VNTR_2 = sum(length_lps_VNTR_2), 
-    tot_length_lps_VNTR_3 = sum(length_lps_VNTR_3), 
-    tot_deviance_hexamer = sum(deviance_hexamer), 
-    tot_deviance_VNTR_1 = sum(deviance_VNTR_1), 
-    tot_deviance_VNTR_2 = sum(deviance_VNTR_2), 
-    tot_deviance_VNTR_3 = sum(deviance_VNTR_3), 
+    tot_length_lps_hexamer = sum(length_lps_hexamer),
+    tot_length_lps_VNTR_1 = sum(length_lps_VNTR_1),
+    tot_length_lps_VNTR_2 = sum(length_lps_VNTR_2),
+    tot_length_lps_VNTR_3 = sum(length_lps_VNTR_3),
+    tot_deviance_lps_hexamer = sum(deviance_lps_hexamer),
+    tot_deviance_lps_VNTR_1 = sum(deviance_lps_VNTR_1),
+    tot_deviance_lps_VNTR_2 = sum(deviance_lps_VNTR_2),
+    tot_deviance_lps_VNTR_3 = sum(deviance_lps_VNTR_3),
     .groups="drop"
   )
 
