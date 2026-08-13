@@ -89,3 +89,21 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: MatchAssemblyHaplotypes
+    primaryDescriptorPath: /workflows/match_assembly_haplotypes.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
+
+  - subclass: WDL
+    name: ProcessRefSVAData
+    primaryDescriptorPath: /workflows/process_ref_sva_data.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
