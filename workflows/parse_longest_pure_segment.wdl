@@ -1,5 +1,9 @@
 version 1.0
 
+
+import "utils/split_files.wdl" as SplitFiles
+import "utils/concat_files.wdl" as ConcatFiles
+
 ## For each SVA (ID) x repeat region (hexamer/VNTR_1/VNTR_2/VNTR_3), finds the
 ## longest pure segment -- the longest run of consecutive repeat-unit calls
 ## that all match the same motif -- and reports that motif and its length,
@@ -10,17 +14,41 @@ workflow ParseLongestPureSegment {
         File RepeatSeqTable
         String Prefix
         String ImageTag = "latest"
+        Int? BatchSize
+    }
+    if (defined(BatchSize)) {
+      Int effective_batch_size = select_first([BatchSize])
+
+      call SplitFiles.SplitFileByGroupCount as SplitRepeatSeqs {
+        input: input_file=RepeatSeqTable, group_column="ID", groups_per_file=effective_batch_size
+      }
+
+        scatter (table in SplitRepeatSeqs.split_files) {
+          String batch_prefix = basename(table, ".txt")
+
+          call FindLongestPureSegment as LPS_Batch {
+            input: RepeatSeqTable = table, ImageTag = ImageTag, Prefix = batch_prefix
+          }
+      }
+      String outfile = Prefix + "_lps_length.txt"
+
+        call ConcatFiles.ConcatenateFiles as ConcatLPS {
+          input: InputFiles = LPS_Batch.LongestPureSegments, OutputName = outfile
+        }
+    }
+    if (!defined(BatchSize)) {
+      call FindLongestPureSegment as LPS_Indiv {
+          input:
+              RepeatSeqTable = RepeatSeqTable,
+              Prefix = Prefix,
+              ImageTag = ImageTag
+      }
+
     }
 
-    call FindLongestPureSegment {
-        input:
-            RepeatSeqTable = RepeatSeqTable,
-            Prefix = Prefix,
-            ImageTag = ImageTag
-    }
 
     output {
-        File LongestPureSegments = FindLongestPureSegment.LongestPureSegments
+        File LongestPureSegments = select_first([LPS_Indiv.LongestPureSegments, ConcatLPS.ConcatenatedFile])
     }
 }
 
