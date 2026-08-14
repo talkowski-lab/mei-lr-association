@@ -39,5 +39,4 @@ ARG SEQKIT_VERSION=2.13.0
 RUN curl -sSL "https://github.com/shenwei356/seqkit/releases/download/v${SEQKIT_VERSION}/seqkit_linux_amd64.tar.gz" \
     | tar xz -C /usr/local/bin seqkit
 
-COPY scripts/ ./scripts/
 CMD ["bash"]
