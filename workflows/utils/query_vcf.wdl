@@ -35,6 +35,7 @@ task BcftoolsQuery {
         String? IncludeExpr
         String? ExcludeExpr
         String OutputName
+        Boolean IncludeHeader = true
         String ImageTag = "latest"
     }
 
@@ -42,6 +43,7 @@ task BcftoolsQuery {
         set -euo pipefail
 
         bcftools query \
+            ~{true="--print-header" false="" IncludeHeader} \
             ~{"-i '" + IncludeExpr + "'"} \
             ~{"-e '" + ExcludeExpr + "'"} \
             -f '~{QueryFormat}' \
