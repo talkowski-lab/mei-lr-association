@@ -33,9 +33,12 @@ repeat {
     nrows = chunk_size,
     header = FALSE,
     col.names = header,
+    colClasses = c(
+      c("character", "integer", "character", "character"),
+      rep("character", length(indivs))
+    ),
     na.strings = c("./.", ".")
   )
-  
 
   if (nrow(chunk) == 0) break
   
