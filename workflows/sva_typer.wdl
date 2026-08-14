@@ -1,18 +1,58 @@
 version 1.0
 
+import "utils/split_files.wdl" as SplitFiles
+import "utils/concat_files.wdl" as ConcatFiles
+
 workflow sva_extract_workflow {
   input {
-    File sva_fasta
+    File SVAFasta
     String ImageTag = "latest"
+    Int? BatchSize
+  }
+  String base = basename(SVAFasta, ".fa")
+
+  if (defined(BatchSize)) {
+    Int effective_batch_size = select_first([BatchSize])
+
+    call SplitFiles.SplitFasta as SplitSVASeqs {
+      input: fasta = SVAFasta, records_per_file = effective_batch_size
+    }
+
+    scatter (fasta in SplitSVASeqs.split_fastas) {
+
+      String batch_prefix = basename(fasta, ".fa")
+      call SVA_typer as SVA_typer_Batch {
+        input: sva_seq_file = fasta, ImageTag = ImageTag, Prefix = batch_prefix
+      }
+    }
+    String outpos = base + "_repeat_positions.txt"
+    String outfile = base + "_repeat_lengths.txt"
+
+    call ConcatFiles.ConcatenateFiles as ConcatLengths {
+      input:
+        InputFiles = SVA_typer_Batch.repeat_lengths,
+        OutputName = outfile
+    }
+
+    call ConcatFiles.ConcatenateFiles as ConcatPositions {
+      input:
+        InputFiles = SVA_typer_Batch.repeat_positions,
+        OutputName = outpos
+    }
+
   }
 
-  call SVA_typer {
-    input:  sva_seq_file = sva_fasta, ImageTag = ImageTag
+  if (!defined(BatchSize)) {
+    call SVA_typer as SVA_typer_Single {
+      input:  sva_seq_file = SVAFasta, ImageTag = ImageTag, Prefix = base
+    }
+
   }
+
 
   output {
-    File repeat_positions = SVA_typer.repeat_positions
-    File repeat_lengths = SVA_typer.repeat_lengths
+    File repeat_positions = select_first([SVA_typer_Single.repeat_positions, ConcatPositions.ConcatenatedFile])
+    File repeat_lengths = select_first([SVA_typer_Single.repeat_lengths, ConcatLengths.ConcatenatedFile])
   }
 }
 
@@ -20,15 +60,15 @@ workflow sva_extract_workflow {
 task SVA_typer {
   input {
     File sva_seq_file
+    String Prefix
     String ImageTag = "latest"
     Int CPU = 2
     Int MemoryGB = 4
     Int? DiskGB
   }
 
-  String base = basename(sva_seq_file, ".fa")
-  String outpos = base + "_repeat_positions.txt"
-  String outfile = base + "_repeat_lengths.txt"
+  String outpos = Prefix + "_repeat_positions.txt"
+  String outfile = Prefix + "_repeat_lengths.txt"
 
   Int auto_disk_size = ceil(size(sva_seq_file, "GB") * 2) + 10
 
