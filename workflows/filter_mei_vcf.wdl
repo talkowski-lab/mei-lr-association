@@ -11,7 +11,7 @@ workflow FilterMEIVCF {
     }
 
     String OutputName = MEIType + "_gt_mat.txt"
-    String IncludeExpr = "INFO/SVTYPE=\"" + MEIType + "\""
+    String IncludeExpr = "INFO/MEI_type=\"" + MEIType + "\""
     String QueryFormat = "%CHROM\t%POS\t%REF\t%ALT[\t%GT]"
 
     call QueryVCF.BcftoolsQuery as VCFQuery {
