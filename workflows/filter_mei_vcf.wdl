@@ -85,6 +85,5 @@ task ClusterMEIGT {
       File ClusteredGT = ClusteredGT_out
       File ExclClusters = ExclClusters_out
     }
-
 }
 

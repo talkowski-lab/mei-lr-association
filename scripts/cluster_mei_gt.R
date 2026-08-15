@@ -27,20 +27,29 @@ chunk_size <- 10000
 chunk_i <- 0
 
 repeat {
-  chunk <- fread(
-    infile,
-    skip = skip,
-    nrows = chunk_size,
-    header = FALSE,
-    col.names = header,
-    colClasses = c(
-      c("character", "integer", "character", "character"),
-      rep("character", length(indivs))
+  # fread errors instead of returning an empty result when `skip` lands
+  # exactly on the file's last line (e.g. "skip=219465 but the input only
+  # has 219465 lines") -- treat that as end-of-data rather than a real error.
+  chunk <- tryCatch(
+    fread(
+      infile,
+      skip = skip,
+      nrows = chunk_size,
+      header = FALSE,
+      col.names = header,
+      colClasses = c(
+        c("character", "integer", "character", "character"),
+        rep("character", length(indivs))
+      ),
+      na.strings = c("./.", ".")
     ),
-    na.strings = c("./.", ".")
+    error = function(e) {
+      if (grepl("but the input only has", conditionMessage(e), fixed = TRUE)) return(NULL)
+      stop(e)
+    }
   )
 
-  if (nrow(chunk) == 0) break
+  if (is.null(chunk) || nrow(chunk) == 0) break
   
   chunk <- tibble(chunk)
   
@@ -61,7 +70,7 @@ repeat {
   gc()
 }
 
-bed_df <- read_delim(argv$mei_cluster_bed) %>%
+bed_df <- read_delim(argv$mei_cluster_bed, col_names=c("chrom", "start", "end", "REF", "ALT", "ID", "MEI_type", "MEI_subfamily", "length", "orientation", "intact_status", "cluster_id")) %>%
   mutate(ALT_md5 = sapply(ALT, digest, algo="md5", serialize=FALSE))
 
 #Now generate final table, joining with length table
