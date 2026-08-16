@@ -39,12 +39,7 @@ top_match <- df %>%
 top_match_wide <- top_match %>%
   ungroup() %>%
   pivot_wider(names_from = region, values_from = c(motif, length_lps)) %>%
-  mutate(
-    indiv = str_split_i(ID, "-", 1),
-    hap = str_extract(ID, "asm_(h[12])", 1),
-    sva_id = str_extract(ID, r"(SVA_\d{4})")
-  ) %>%
-  select(indiv, hap, sva_id, ends_with("hexamer"), ends_with("VNTR_1"), ends_with("VNTR_2"), ends_with("VNTR_3")) %>%
+  select(ID, ends_with("hexamer"), ends_with("VNTR_1"), ends_with("VNTR_2"), ends_with("VNTR_3")) %>%
   mutate(across(starts_with("length"), ~ replace_na(.x, 0)))
 
-write_delim(top_match_wide, glue("{argv$prefix}_lps_length.txt"))
+write_tsv(top_match_wide, glue("{argv$prefix}_lps_length.txt"))
