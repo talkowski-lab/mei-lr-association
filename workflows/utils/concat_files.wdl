@@ -1,6 +1,6 @@
 version 1.0
 
-task ConcatenateFiles {
+task ConcatenateDelim {
   input {
     Array[File] InputFiles
     Boolean HasHeader = true
@@ -149,6 +149,64 @@ CODE
 
   output {
     File ConcatenatedFile = "~{FinalOutputName}"
+  }
+
+  runtime {
+    docker: "ayenkin1871/mei-lr-association-python_general:" + ImageTag
+    cpu: CPU
+    memory: MemoryGB + " GB"
+    disks: "local-disk " + select_first([DiskGB, auto_disk_size]) + " SSD"
+    preemptible: 3
+    maxRetries: 2
+  }
+}
+
+## Vertically concatenates a list of Parquet files (all must share the same
+## schema), writing the result out as either Parquet or delimited text.
+task ConcatParquet {
+  input {
+    Array[File] InputFiles
+    String OutputFormat = "parquet"
+    String Delimiter = "\t"
+    String OutputName = "concatenated.parquet"
+    String ImageTag = "latest"
+    Int CPU = 2
+    Int MemoryGB = 4
+    Int? DiskGB
+  }
+
+  Int auto_disk_size = ceil(size(InputFiles, "GiB") * 3) + 10
+
+  command <<<
+    set -euo pipefail
+
+    cat > input_files_manifest.txt <<'MANIFEST_EOF'
+~{sep="\n" InputFiles}
+MANIFEST_EOF
+
+    python3 <<CODE
+import polars as pl
+
+output_format = "~{OutputFormat}"
+delimiter = "~{Delimiter}"
+out_path = "~{OutputName}"
+
+with open("input_files_manifest.txt") as f:
+    files = [line.strip() for line in f if line.strip()]
+
+df = pl.concat([pl.read_parquet(fp) for fp in files], how="vertical")
+
+if output_format == "parquet":
+    df.write_parquet(out_path)
+elif output_format == "text":
+    df.write_csv(out_path, separator=delimiter)
+else:
+    raise ValueError(f"Unknown --output-format: {output_format!r} (expected 'parquet' or 'text')")
+CODE
+  >>>
+
+  output {
+    File ConcatenatedFile = OutputName
   }
 
   runtime {

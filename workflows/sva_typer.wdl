@@ -28,13 +28,13 @@ workflow sva_extract_workflow {
     String outpos = base + "_repeat_positions.txt"
     String outfile = base + "_repeat_lengths.txt"
 
-    call ConcatFiles.ConcatenateFiles as ConcatLengths {
+    call ConcatFiles.ConcatenateDelim as ConcatLengths {
       input:
         InputFiles = SVA_typer_Batch.repeat_lengths,
         OutputName = outfile
     }
 
-    call ConcatFiles.ConcatenateFiles as ConcatPositions {
+    call ConcatFiles.ConcatenateDelim as ConcatPositions {
       input:
         InputFiles = SVA_typer_Batch.repeat_positions,
         OutputName = outpos

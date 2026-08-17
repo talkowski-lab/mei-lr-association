@@ -23,12 +23,12 @@ import "utils/concat_files.wdl" as ConcatFiles
 ##
 ## BatchSize is optional and off by default. Cromwell localizes every File in
 ## InputFiles before a task's command even starts, so with thousands of small
-## files, one giant ConcatenateFiles call pays for all of that localization
+## files, one giant ConcatenateDelim call pays for all of that localization
 ## serially on a single VM. If BatchSize is set, InputFiles is instead chunked
 ## into groups of that size, each chunk is localized/concatenated by its own
-## ConcatenateFiles call (so localization is spread across many concurrent
+## ConcatenateDelim call (so localization is spread across many concurrent
 ## tasks instead of one), and the resulting per-batch files are concatenated
-## again by a final ConcatenateFiles call (which is where GzipOutput is
+## again by a final ConcatenateDelim call (which is where GzipOutput is
 ## actually applied -- per-batch outputs are always left ungzipped so this
 ## final call can still parse them as text). If BatchSize is unset, this
 ## collapses back to the original single-call behavior with no scatter at all.
@@ -82,7 +82,7 @@ workflow ConcatenateAndProcessFiles {
         }
       }
 
-      call ConcatFiles.ConcatenateFiles as ConcatenateBatch {
+      call ConcatFiles.ConcatenateDelim as ConcatenateBatch {
         input:
           InputFiles = batch_file,
           HasHeader = HasHeader,
@@ -101,7 +101,7 @@ workflow ConcatenateAndProcessFiles {
     # Batch outputs already have (at most) one header each and their rows are
     # already ID-tagged, so no script/ID-column options are passed here --
     # this call only re-applies header de-dup across batches and GzipOutput.
-    call ConcatFiles.ConcatenateFiles as MergeBatches {
+    call ConcatFiles.ConcatenateDelim as MergeBatches {
       input:
         InputFiles = ConcatenateBatch.ConcatenatedFile,
         HasHeader = HasHeader,
@@ -113,7 +113,7 @@ workflow ConcatenateAndProcessFiles {
   }
 
   if (!defined(BatchSize)) {
-    call ConcatFiles.ConcatenateFiles as ConcatenateSingle {
+    call ConcatFiles.ConcatenateDelim as ConcatenateSingle {
       input:
         InputFiles = InputFiles,
         HasHeader = HasHeader,

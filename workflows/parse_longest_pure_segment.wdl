@@ -32,7 +32,7 @@ workflow ParseLongestPureSegment {
       }
       String outfile = Prefix + "_lps_length.txt"
 
-        call ConcatFiles.ConcatenateFiles as ConcatLPS {
+        call ConcatFiles.ConcatenateDelim as ConcatLPS {
           input: InputFiles = LPS_Batch.LongestPureSegments, OutputName = outfile
         }
     }
