@@ -134,3 +134,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: FinemapSVAMultiomics
+    primaryDescriptorPath: /workflows/finemap_sva.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/

@@ -2,8 +2,11 @@
 ## analysis scripts (e.g. ref_sva_qc.R). rocker/verse ships R, tidyverse,
 ## pandoc, and TinyTeX (for PDF output) already.
 FROM rocker/verse:4.4.1
-RUN R -e "install.packages(c('optparse', 'argparser', 'jsonlite', 'AnVIL', 'AnVILGCP', 'data.table', 'ggplot2', 'ggthemes', 'glue', 'arrow', 'BiocManager'), repos = 'https://cloud.r-project.org')" \
-    && R -e "BiocManager::install(c('Biostrings', 'GenomicRanges'), update = FALSE, ask = FALSE)"
+## AnVIL and AnVILGCP are Bioconductor (not CRAN) packages -- installing them
+## via install.packages() silently no-ops (it only warns on missing packages,
+## it doesn't fail the build), so they must go through BiocManager instead.
+RUN R -e "install.packages(c('optparse', 'argparser', 'jsonlite', 'data.table', 'ggplot2', 'ggthemes', 'glue', 'arrow', 'BiocManager'), repos = 'https://cloud.r-project.org')" \
+    && R -e "BiocManager::install(c('Biostrings', 'GenomicRanges', 'AnVIL', 'AnVILGCP'), update = FALSE, ask = FALSE)"
 
 ## Build samtools/bcftools from source with --enable-libcurl so htslib's remote
 ## file support can read gs:// (and s3://) URLs directly, not just local paths.
