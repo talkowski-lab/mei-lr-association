@@ -125,3 +125,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: NominalAssociation
+    primaryDescriptorPath: /workflows/nominal_association.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
