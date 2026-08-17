@@ -116,3 +116,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: ProcessMEISVAData
+    primaryDescriptorPath: /workflows/process_mei_sva_data.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/

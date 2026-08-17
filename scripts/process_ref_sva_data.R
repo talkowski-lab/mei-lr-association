@@ -199,6 +199,7 @@ med_gt_ref_sva_length_perindiv <- med_gt_tidy %>%
   arrange(indiv, sva_id)
 
 med_gt_ref_sva_length_perindiv %>%
+  distinct() %>%
   write_tsv("rMEI_SVA_totlength_perindiv_filtered.txt.gz")
 
 med_ref_sva_length_lps_perindiv <- ref_sva_length_lps_df_with_dev %>% 
@@ -222,6 +223,7 @@ med_gt_ref_sva_length_lps_perindiv <- med_gt_ref_sva_length_perindiv %>%
   mutate(across(starts_with("tot"), ~ replace_na(.x, 0))) 
 
 med_gt_ref_sva_length_lps_perindiv %>%
+  distinct() %>%
   write_tsv("rMEI_SVA_totlength_lps_perindiv_filtered.txt.gz")
 
 
