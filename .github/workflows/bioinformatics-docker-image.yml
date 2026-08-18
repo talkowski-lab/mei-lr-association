@@ -58,4 +58,4 @@ jobs:
         env:
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: .github/scripts/prune_docker_tags.sh "${{ steps.meta.outputs.IMAGE }}" 5
+        run: .github/scripts/prune_docker_tags.sh "${{ steps.meta.outputs.IMAGE }}" 5 "${{ steps.meta.outputs.SHORT_SHA }}"

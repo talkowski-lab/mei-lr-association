@@ -4,8 +4,9 @@
 ## in the environment (the token needs read/write/delete permissions).
 set -euo pipefail
 
-IMAGE="$1"      # e.g. myuser/myrepo-hail
-KEEP="${2:-5}"  # number of most-recent non-"latest" tags to keep
+IMAGE="$1"        # e.g. myuser/myrepo-hail
+KEEP="${2:-5}"    # number of most-recent non-"latest" tags to keep
+PROTECT="${3:-}"  # tag this run just pushed (e.g. the short SHA) -- never delete it
 
 TOKEN=$(curl -s -H "Content-Type: application/json" \
   -X POST -d "{\"username\": \"${DOCKERHUB_USERNAME}\", \"password\": \"${DOCKERHUB_TOKEN}\"}" \
@@ -34,6 +35,14 @@ echo "Found ${#TAGS[@]} tags for ${IMAGE} (newest first)."
 KEPT=0
 for TAG in "${TAGS[@]}"; do
   if [ "$TAG" == "latest" ]; then
+    continue
+  fi
+  # Docker Hub's ordering=-last_updated listing isn't guaranteed to reflect
+  # a tag pushed moments ago (this script runs right after the push, in the
+  # same job) -- it can sort as if older than every pre-existing tag, which
+  # would otherwise get it treated as "oldest" and deleted. Protect this
+  # run's own tag explicitly rather than trusting the API's freshness.
+  if [ -n "$PROTECT" ] && [ "$TAG" == "$PROTECT" ]; then
     continue
   fi
   if [ "$KEPT" -lt "$KEEP" ]; then
