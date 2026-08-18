@@ -7,6 +7,13 @@ import "utils/concat_files.wdl" as ConcatFiles
 ## ID column (this ID-column logic was merged in from, and supersedes, the
 ## now-removed ConcatenateColumnFiles workflow in concat_files.wdl).
 ##
+## FileType selects the concatenation task: "delim" (default) uses
+## ConcatenateDelim -- delimited text, with the preprocessing-script and
+## ID-column options below. "parquet" uses ConcatParquet -- a plain vertical
+## concat of Parquet files with the same schema; none of the delim-only
+## options (HasHeader, GzipOutput, RemoteScript, EmbeddedScriptPath,
+## AddIdColumn, Ids, NewIdColumnName, Delimiter) apply in that mode.
+##
 ## RemoteScript (a File, e.g. a gs:// path -- localized by Cromwell like any
 ## other File input) and EmbeddedScriptPath (a path already baked into the
 ## Docker image, e.g. "/scripts/foo.py") are mutually exclusive; if both are
@@ -23,19 +30,20 @@ import "utils/concat_files.wdl" as ConcatFiles
 ##
 ## BatchSize is optional and off by default. Cromwell localizes every File in
 ## InputFiles before a task's command even starts, so with thousands of small
-## files, one giant ConcatenateDelim call pays for all of that localization
+## files, one giant concatenation call pays for all of that localization
 ## serially on a single VM. If BatchSize is set, InputFiles is instead chunked
 ## into groups of that size, each chunk is localized/concatenated by its own
-## ConcatenateDelim call (so localization is spread across many concurrent
-## tasks instead of one), and the resulting per-batch files are concatenated
-## again by a final ConcatenateDelim call (which is where GzipOutput is
-## actually applied -- per-batch outputs are always left ungzipped so this
-## final call can still parse them as text). If BatchSize is unset, this
-## collapses back to the original single-call behavior with no scatter at all.
+## call (so localization is spread across many concurrent tasks instead of
+## one), and the resulting per-batch files are concatenated again by a final
+## call (which is where GzipOutput is actually applied, for FileType=delim --
+## per-batch outputs are always left ungzipped so this final call can still
+## parse them as text). If BatchSize is unset, this collapses back to the
+## original single-call behavior with no scatter at all.
 
 workflow ConcatenateAndProcessFiles {
   input {
     Array[File] InputFiles
+    String FileType = "delim"  # "delim" or "parquet"
     Boolean? HasHeader
     Boolean? GzipOutput
     File? RemoteScript
@@ -45,8 +53,13 @@ workflow ConcatenateAndProcessFiles {
     String? NewIdColumnName
     String? Delimiter
     String? OutputName
-    String? ImageTag 
+    String? ImageTag
     Int? BatchSize
+
+    Int BatchCPU = 2
+    Int BatchMemoryGB = 4
+    Int MergeCPU = 2
+    Int MergeMemoryGB = 4
   }
 
   Int total_files = length(InputFiles)
@@ -60,7 +73,7 @@ workflow ConcatenateAndProcessFiles {
       # available -- gather this batch's indices via select_all over a masked
       # range, then gather the actual Files (and Ids, if given) by those indices.
       # None of this touches file *contents*, so nothing gets localized here --
-      # only the ConcatenateBatch call below localizes anything, and only the
+      # only the ConcatenateBatch* call below localizes anything, and only the
       # ~effective_batch_size files that belong to its one batch.
       scatter (file_pos in range(total_files)) {
         # WDL 1.0 has no `None` literal, so an if-block (rather than a
@@ -82,55 +95,109 @@ workflow ConcatenateAndProcessFiles {
         }
       }
 
-      call ConcatFiles.ConcatenateDelim as ConcatenateBatch {
-        input:
-          InputFiles = batch_file,
-          HasHeader = HasHeader,
-          GzipOutput = false,
-          RemoteScript = RemoteScript,
-          EmbeddedScriptPath = EmbeddedScriptPath,
-          AddIdColumn = AddIdColumn,
-          Ids = batch_id_elem,
-          NewIdColumnName = NewIdColumnName,
-          Delimiter = Delimiter,
-          OutputName = "batch_" + batch_idx + ".txt",
-          ImageTag = ImageTag
+      if (FileType == "delim") {
+        call ConcatFiles.ConcatenateDelim as ConcatenateBatchDelim {
+          input:
+            InputFiles = batch_file,
+            HasHeader = HasHeader,
+            GzipOutput = false,
+            RemoteScript = RemoteScript,
+            EmbeddedScriptPath = EmbeddedScriptPath,
+            AddIdColumn = AddIdColumn,
+            Ids = batch_id_elem,
+            NewIdColumnName = NewIdColumnName,
+            Delimiter = Delimiter,
+            OutputName = "batch_" + batch_idx + ".txt",
+            ImageTag = ImageTag,
+            CPU = BatchCPU,
+            MemoryGB = BatchMemoryGB
+        }
       }
+
+      if (FileType == "parquet") {
+        call ConcatFiles.ConcatParquet as ConcatenateBatchParquet {
+          input:
+            InputFiles = batch_file,
+            OutputName = "batch_" + batch_idx + ".parquet",
+            ImageTag = ImageTag,
+            CPU = BatchCPU,
+            MemoryGB = BatchMemoryGB
+
+        }
+      }
+
+      File batch_output = select_first([ConcatenateBatchDelim.ConcatenatedFile, ConcatenateBatchParquet.ConcatenatedFile])
     }
 
     # Batch outputs already have (at most) one header each and their rows are
     # already ID-tagged, so no script/ID-column options are passed here --
     # this call only re-applies header de-dup across batches and GzipOutput.
-    call ConcatFiles.ConcatenateDelim as MergeBatches {
-      input:
-        InputFiles = ConcatenateBatch.ConcatenatedFile,
-        HasHeader = HasHeader,
-        GzipOutput = GzipOutput,
-        Delimiter = Delimiter,
-        OutputName = OutputName,
-        ImageTag = ImageTag
+    if (FileType == "delim") {
+      call ConcatFiles.ConcatenateDelim as MergeBatchesDelim {
+        input:
+          InputFiles = batch_output,
+          HasHeader = HasHeader,
+          GzipOutput = GzipOutput,
+          AddIdColumn = false,
+          Delimiter = Delimiter,
+          OutputName = OutputName,
+          ImageTag = ImageTag,
+          CPU = MergeCPU,
+          MemoryGB = MergeMemoryGB
+      }
+    }
+
+    if (FileType == "parquet") {
+      call ConcatFiles.ConcatParquet as MergeBatchesParquet {
+        input:
+          InputFiles = batch_output,
+          OutputName = OutputName,
+          ImageTag = ImageTag,
+          CPU = MergeCPU,
+          MemoryGB = MergeMemoryGB
+      }
     }
   }
 
   if (!defined(BatchSize)) {
-    call ConcatFiles.ConcatenateDelim as ConcatenateSingle {
-      input:
-        InputFiles = InputFiles,
-        HasHeader = HasHeader,
-        GzipOutput = GzipOutput,
-        RemoteScript = RemoteScript,
-        EmbeddedScriptPath = EmbeddedScriptPath,
-        AddIdColumn = AddIdColumn,
-        Ids = Ids,
-        NewIdColumnName = NewIdColumnName,
-        Delimiter = Delimiter,
-        OutputName = OutputName,
-        ImageTag = ImageTag
+    if (FileType == "delim") {
+      call ConcatFiles.ConcatenateDelim as ConcatenateSingleDelim {
+        input:
+          InputFiles = InputFiles,
+          HasHeader = HasHeader,
+          GzipOutput = GzipOutput,
+          RemoteScript = RemoteScript,
+          EmbeddedScriptPath = EmbeddedScriptPath,
+          AddIdColumn = AddIdColumn,
+          Ids = Ids,
+          NewIdColumnName = NewIdColumnName,
+          Delimiter = Delimiter,
+          OutputName = OutputName,
+          ImageTag = ImageTag,
+          CPU = BatchCPU,
+          MemoryGB = BatchMemoryGB
+      }
+    }
+
+    if (FileType == "parquet") {
+      call ConcatFiles.ConcatParquet as ConcatenateSingleParquet {
+        input:
+          InputFiles = InputFiles,
+          OutputName = OutputName,
+          ImageTag = ImageTag,
+          CPU = BatchCPU,
+          MemoryGB = BatchMemoryGB
+      }
     }
   }
 
   output {
-    File ConcatenatedFile = select_first([MergeBatches.ConcatenatedFile, ConcatenateSingle.ConcatenatedFile])
+    File ConcatenatedFile = select_first([
+      MergeBatchesDelim.ConcatenatedFile,
+      MergeBatchesParquet.ConcatenatedFile,
+      ConcatenateSingleDelim.ConcatenatedFile,
+      ConcatenateSingleParquet.ConcatenatedFile
+    ])
   }
 }
 

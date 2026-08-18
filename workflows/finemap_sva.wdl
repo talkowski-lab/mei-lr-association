@@ -1,6 +1,6 @@
 version 1.0
 
-import "utils/concat_files.wdl" as ConcatFiles
+import "concat_files_with_script.wdl" as ConcatFiles
 import "https://raw.githubusercontent.com/AoU-Multiomics-Analysis/susieR/refs/heads/main/workflows/susieRonly.wdl" as susieRonly
 
 
@@ -73,16 +73,24 @@ workflow FinemapSVAMultiomics {
     }
   }
 
-  call ConcatFiles.ConcatParquet as eQTL_SusieParq_Concat {
+  call ConcatFiles.ConcatenateAndProcessFiles as eQTL_SusieParq_Concat {
     input:
       InputFiles = eQTL_Susie.SusieParquet,
-      OutputName = eQTL_FM_Prefix + "_susie.parquet"
+      OutputName = eQTL_FM_Prefix + "_susie.parquet",
+      FileType = "parquet",
+      BatchSize = 100,
+      BatchMemoryGB = 8,
+      MergeMemoryGB = 32
   }
 
-  call ConcatFiles.ConcatParquet as eQTL_FullSusieParq_Concat {
+  call ConcatFiles.ConcatenateAndProcessFiles as eQTL_FullSusieParq_Concat {
     input:
       InputFiles = eQTL_Susie.FullSusieParquet,
-      OutputName = eQTL_FM_Prefix + "_full_susie.parquet"
+      OutputName = eQTL_FM_Prefix + "_full_susie.parquet",
+      FileType = "parquet",
+      BatchSize = 100,
+      BatchMemoryGB = 8,
+      MergeMemoryGB = 32
   }
 
   output {
