@@ -1,7 +1,6 @@
 version 1.0
 
 import "utils/concat_files.wdl" as ConcatFiles
-import "utils/download_avtable.wdl" as AVTableUtils
 import "https://raw.githubusercontent.com/AoU-Multiomics-Analysis/susieR/refs/heads/main/workflows/susieRonly.wdl" as susieRonly
 
 
@@ -22,13 +21,12 @@ workflow FinemapSVAMultiomics {
     File pQTL_Covariates
 
     File eQTL_TensorQTLPerm
+    File eQTL_PhenotypeBed
 
-    String eQTL_AVTable
-    String sQTL_AVTable
-    String pQTL_AVTable
-
-    String WorkspaceNamespace
-    String WorkspaceName
+    # Already-downloaded QTL data tables (id column first).
+    File eQTL_AVTable
+    File sQTL_AVTable
+    File pQTL_AVTable
 
     String? Prefix
 
@@ -45,14 +43,8 @@ workflow FinemapSVAMultiomics {
       SignatureType = "expression",
       QTLAssocSummary = eQTLAssocSummary,
       SVAGTBed = SVAGTBed,
+      AVTable = eQTL_AVTable,
       Prefix = eQTL_FM_Prefix
-  }
-
-  call AVTableUtils.DownloadAVTable as eQTL_DownloadAVTable {
-    input:
-      AVTableName = eQTL_AVTable,
-      WorkspaceNamespace = WorkspaceNamespace,
-      WorkspaceName = WorkspaceName
   }
 
   scatter (batch_idx in range(length(eQTL_signifSVAs.FeatureNames))) {
@@ -60,8 +52,7 @@ workflow FinemapSVAMultiomics {
 
     call GatherSNVFM_Input as eQTL_GetSNVFM_Input {
       input:
-        AVTableFile = eQTL_DownloadAVTable.AVTableData,
-        QTL_AVTable = eQTL_AVTable,
+        AVTableFile = eQTL_AVTable,
         GeneName = eQTL_FeatureName
     }
 
@@ -72,10 +63,10 @@ workflow FinemapSVAMultiomics {
         QTLCovariates = eQTL_Covariates,
         TensorQTLPermutations = eQTL_TensorQTLPerm,
         SampleList = eQTL_SampleList,
-        PhenotypeBed = eQTL_GetSNVFM_Input.PhenotypeBed,
+        PhenotypeBed = eQTL_PhenotypeBed,
         CisDistance = CisDistance,
         AdditionalGenotypesBed = eQTL_signifSVAs.SignificantSVAGT,
-        OutputPrefix = eQTL_FM_Prefix + "_" + eQTL_FeatureName,
+        OutputPrefix = eQTL_FeatureName,
         memory = Memory,
         NumPrempt = NumPreempt,
         MAF = MAF
@@ -106,13 +97,16 @@ workflow FinemapSVAMultiomics {
 # Filter the Assoc Table to those with a pvalue below PValueThreshold, then
 # join each significant (sva_id, feature) pair against the SVA genotype/
 # repeat-length BED to produce the list of significant pairs plus one wide
-# row per (variant, feature) combination.
+# row per (variant, feature) combination. Also drops any feature not present
+# in the first column of AVTable (it would otherwise fail a per-feature
+# AVTable lookup downstream), reporting dropped features to stderr.
 # If SignatureType is splice, the leafcutter feature is collapsed to its gene id.
 task SubsetSignificantSVAGT {
   input {
     String SignatureType
     File QTLAssocSummary
     File SVAGTBed
+    File AVTable
     Float PValueThreshold = 0.01
     String Prefix = "sig_sva"
     String ImageTag = "latest"
@@ -120,7 +114,7 @@ task SubsetSignificantSVAGT {
     Int? DiskGB
   }
 
-  Int auto_disk_size = ceil(size([QTLAssocSummary, SVAGTBed], "GB") * 2) + 10
+  Int auto_disk_size = ceil(size([QTLAssocSummary, SVAGTBed, AVTable], "GB") * 2) + 10
 
   command <<<
     set -euo pipefail
@@ -128,6 +122,7 @@ task SubsetSignificantSVAGT {
     Rscript /scripts/subset_significant_sva_gt.R \
         --qtl-assoc-summary ~{QTLAssocSummary} \
         --sva-gt-bed ~{SVAGTBed} \
+        --avtable-file ~{AVTable} \
         --signature-type ~{SignatureType} \
         --p-threshold ~{PValueThreshold} \
         --prefix ~{Prefix}
@@ -150,12 +145,13 @@ task SubsetSignificantSVAGT {
   }
 }
 
-# Takes a string representing the table on terra and a string representing the gene name identifier and pulls the requested columns
+# Looks up one row (by GeneName, matched against the table's first/id
+# column) in an already-downloaded QTL data table and pulls the requested
+# fine-mapping input columns.
 task GatherSNVFM_Input {
 
   input {
     File AVTableFile
-    String QTL_AVTable
     String GeneName
     String ImageTag = "latest"
     Int MemoryGB = 4
@@ -167,7 +163,6 @@ task GatherSNVFM_Input {
 
     Rscript /scripts/gather_snv_fm_input.R \
         --avtable-file ~{AVTableFile} \
-        --qtl-avtable ~{QTL_AVTable} \
         --gene-name ~{GeneName}
   >>>
 

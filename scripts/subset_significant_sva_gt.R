@@ -19,11 +19,14 @@ library(argparser)
 ##
 ## Also emits the significant pairs grouped by feature (parallel
 ## feature_names.json / sva_ids.json arrays), for driving a per-feature
-## scatter downstream.
+## scatter downstream. Features not present in the AVTable (first column)
+## are dropped -- they'd otherwise fail a per-feature AVTable lookup later --
+## and reported to stderr.
 
 argv <- arg_parser("Subset a QTL association summary to nominally significant SVA x feature pairs, and gather their genotype/repeat-length data") %>%
   add_argument("--qtl-assoc-summary", help = "nominal_association.R summary TSV (sva_id, feature, var_id, beta, p)") %>%
   add_argument("--sva-gt-bed", help = "Per-individual SVA genotype/repeat-length BED (e.g. ProcessMEISVAData matrix)") %>%
+  add_argument("--avtable-file", help = "Already-downloaded QTL data table TSV (id column first) -- features not present here are dropped") %>%
   add_argument("--signature-type", help = "QTL signature type: 'expression', 'splice', or 'protein'") %>%
   add_argument("--p-threshold", help = "Nominal p-value cutoff for significance", default = 0.01) %>%
   add_argument("--prefix", help = "Output file prefix", default = "sig_sva") %>%
@@ -39,6 +42,19 @@ if (argv$signature_type == "splice") {
 
 sig_pairs <- assoc %>%
   distinct(sva_id, feature)
+
+avtable_ids <- read_tsv(argv$avtable_file, show_col_types = FALSE, col_select = 1)[[1]]
+
+missing_features <- setdiff(unique(sig_pairs$feature), avtable_ids)
+if (length(missing_features) > 0) {
+  message(glue(
+    "{length(missing_features)} significant feature(s) not present in the AVTable, dropping: ",
+    "{paste(missing_features, collapse = ', ')}"
+  ))
+}
+
+sig_pairs <- sig_pairs %>%
+  filter(feature %in% avtable_ids)
 
 sig_pairs %>%
   write_tsv(glue("{argv$prefix}_sig_pairs.txt"))
