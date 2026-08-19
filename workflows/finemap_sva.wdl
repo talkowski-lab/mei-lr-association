@@ -1,6 +1,7 @@
 version 1.0
 
 import "concat_files_with_script.wdl" as ConcatFiles
+import "utils/build_file_map.wdl" as FileMapUtils
 import "https://raw.githubusercontent.com/AoU-Multiomics-Analysis/susieR/refs/heads/main/workflows/susieRonly.wdl" as susieRonly
 
 
@@ -30,12 +31,16 @@ workflow FinemapSVAMultiomics {
 
     String? Prefix
 
+    Float? PValueThreshold
+    String? SubsetImageTag
     Int CisDistance = 1000000
     Int Memory = 64
     Int NumPreempt = 3
     Float? MAF
   }
 
+  ## ----------------------------------------------------------------------------------------
+  # eQTL Section
   String eQTL_FM_Prefix = if defined(Prefix) then select_first([Prefix]) + "_eQTL" else "eQTL"
 
   call SubsetSignificantSVAGT as eQTL_signifSVAs {
@@ -44,7 +49,9 @@ workflow FinemapSVAMultiomics {
       QTLAssocSummary = eQTLAssocSummary,
       SVAGTBed = SVAGTBed,
       AVTable = eQTL_AVTable,
-      Prefix = eQTL_FM_Prefix
+      PValueThreshold = PValueThreshold,
+      Prefix = eQTL_FM_Prefix,
+      ImageTag = SubsetImageTag
   }
 
   scatter (batch_idx in range(length(eQTL_signifSVAs.FeatureNames))) {
@@ -83,21 +90,143 @@ workflow FinemapSVAMultiomics {
       MergeMemoryGB = 32
   }
 
-  call ConcatFiles.ConcatenateAndProcessFiles as eQTL_FullSusieParq_Concat {
+  call FileMapUtils.BuildFileMap as eQTL_SusieAuxFileMap {
     input:
-      InputFiles = eQTL_Susie.FullSusieParquet,
-      OutputName = eQTL_FM_Prefix + "_full_susie.parquet",
+      Keys = eQTL_FeatureName,
+      Values = [eQTL_Susie.lbfParquet, eQTL_Susie.FullSusieParquet, eQTL_Susie.VariantPositionSummary, eQTL_Susie.SusieObject]
+  }
+
+  # call ConcatFiles.ConcatenateAndProcessFiles as eQTL_FullSusieParq_Concat {
+  #   input:
+  #     InputFiles = eQTL_Susie.FullSusieParquet,
+  #     OutputName = eQTL_FM_Prefix + "_full_susie.parquet",
+  #     FileType = "parquet",
+  #     BatchSize = 100,
+  #     BatchMemoryGB = 8,
+  #     MergeMemoryGB = 32
+  # }
+
+  ## ----------------------------------------------------------------------------------------
+  # sQTL Section
+  String sQTL_FM_Prefix = if defined(Prefix) then select_first([Prefix]) + "_sQTL" else "sQTL"
+
+  call SubsetSignificantSVAGT as sQTL_signifSVAs {
+    input:
+      SignatureType = "splice",
+      QTLAssocSummary = sQTLAssocSummary,
+      SVAGTBed = SVAGTBed,
+      AVTable = sQTL_AVTable,
+      PValueThreshold = PValueThreshold,
+      Prefix = sQTL_FM_Prefix,
+      ImageTag = SubsetImageTag
+  }
+
+  scatter (batch_idx in range(length(sQTL_signifSVAs.FeatureNames))) {
+    String sQTL_FeatureName = sQTL_signifSVAs.FeatureNames[batch_idx]
+
+    call GatherSNVFM_Input as sQTL_GetSNVFM_Input {
+      input:
+        AVTableFile = sQTL_AVTable,
+        GeneName = sQTL_FeatureName
+    }
+
+    call susieRonly.susieR as sQTL_Susie {
+      input:
+        GenotypeDosages = sQTL_GetSNVFM_Input.GenotypeDosages,
+        GenotypeDosageIndex = sQTL_GetSNVFM_Input.GenotypeDosagesIndex,
+        QTLCovariates = sQTL_Covariates,
+        TensorQTLPermutations = sQTL_GetSNVFM_Input.TensorQTLPermutations,
+        SampleList = sQTL_SampleList,
+        PhenotypeBed = sQTL_GetSNVFM_Input.PhenotypeBed,
+        CisDistance = CisDistance,
+        AdditionalGenotypesBed = sQTL_signifSVAs.SignificantSVAGT,
+        OutputPrefix = sQTL_FeatureName,
+        memory = Memory,
+        NumPrempt = NumPreempt,
+        MAF = MAF
+    }
+  }
+
+  call ConcatFiles.ConcatenateAndProcessFiles as sQTL_SusieParq_Concat {
+    input:
+      InputFiles = sQTL_Susie.SusieParquet,
+      OutputName = sQTL_FM_Prefix + "_susie.parquet",
       FileType = "parquet",
       BatchSize = 100,
       BatchMemoryGB = 8,
       MergeMemoryGB = 32
   }
 
+  call FileMapUtils.BuildFileMap as sQTL_SusieAuxFileMap {
+    input:
+      Keys = sQTL_FeatureName,
+      Values = [sQTL_Susie.lbfParquet, sQTL_Susie.FullSusieParquet, sQTL_Susie.VariantPositionSummary, sQTL_Susie.SusieObject]
+  }
+
+  ## ----------------------------------------------------------------------------------------
+  # pQTL Section
+  String pQTL_FM_Prefix = if defined(Prefix) then select_first([Prefix]) + "_pQTL" else "pQTL"
+
+  call SubsetSignificantSVAGT as pQTL_signifSVAs {
+    input:
+      SignatureType = "protein",
+      QTLAssocSummary = pQTLAssocSummary,
+      SVAGTBed = SVAGTBed,
+      AVTable = pQTL_AVTable,
+      PValueThreshold = PValueThreshold,
+      Prefix = pQTL_FM_Prefix,
+      ImageTag = SubsetImageTag
+  }
+
+  scatter (batch_idx in range(length(pQTL_signifSVAs.FeatureNames))) {
+    String pQTL_FeatureName = pQTL_signifSVAs.FeatureNames[batch_idx]
+
+    call GatherSNVFM_Input as pQTL_GetSNVFM_Input {
+      input:
+        AVTableFile = pQTL_AVTable,
+        GeneName = pQTL_FeatureName
+    }
+
+    call susieRonly.susieR as pQTL_Susie {
+      input:
+        GenotypeDosages = pQTL_GetSNVFM_Input.GenotypeDosages,
+        GenotypeDosageIndex = pQTL_GetSNVFM_Input.GenotypeDosagesIndex,
+        QTLCovariates = pQTL_Covariates,
+        TensorQTLPermutations = pQTL_GetSNVFM_Input.TensorQTLPermutations,
+        SampleList = pQTL_SampleList,
+        PhenotypeBed = pQTL_GetSNVFM_Input.PhenotypeBed,
+        CisDistance = CisDistance,
+        AdditionalGenotypesBed = pQTL_signifSVAs.SignificantSVAGT,
+        OutputPrefix = pQTL_FeatureName,
+        memory = Memory,
+        NumPrempt = NumPreempt,
+        MAF = MAF
+    }
+  }
+
+  call ConcatFiles.ConcatenateAndProcessFiles as pQTL_SusieParq_Concat {
+    input:
+      InputFiles = pQTL_Susie.SusieParquet,
+      OutputName = pQTL_FM_Prefix + "_susie.parquet",
+      FileType = "parquet",
+      BatchSize = 100,
+      BatchMemoryGB = 8,
+      MergeMemoryGB = 32
+  }
+
+  call FileMapUtils.BuildFileMap as pQTL_SusieAuxFileMap {
+    input:
+      Keys = pQTL_FeatureName,
+      Values = [pQTL_Susie.lbfParquet, pQTL_Susie.FullSusieParquet, pQTL_Susie.VariantPositionSummary, pQTL_Susie.SusieObject]
+  }
+
   output {
     File eQTL_SusieParquet = eQTL_SusieParq_Concat.ConcatenatedFile
-    File eQTL_FullSusieParquet = eQTL_FullSusieParq_Concat.ConcatenatedFile
-    File eQTL_SignificantPairs = eQTL_signifSVAs.SignificantPairs
-    File eQTL_SignificantSVAGT = eQTL_signifSVAs.SignificantSVAGT
+    Map[String, Array[File]] eQTL_SusieAuxFiles = eQTL_SusieAuxFileMap.FileMap
+    File sQTL_SusieParquet = sQTL_SusieParq_Concat.ConcatenatedFile
+    Map[String, Array[File]] sQTL_SusieAuxFiles = sQTL_SusieAuxFileMap.FileMap
+    File pQTL_SusieParquet = pQTL_SusieParq_Concat.ConcatenatedFile
+    Map[String, Array[File]] pQTL_SusieAuxFiles = pQTL_SusieAuxFileMap.FileMap
   }
 }
 
