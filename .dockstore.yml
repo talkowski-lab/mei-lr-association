@@ -143,3 +143,30 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: FinemapSVAeQTL
+    primaryDescriptorPath: /workflows/finemap_sva_eqtl.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
+
+  - subclass: WDL
+    name: FinemapSVAsQTL
+    primaryDescriptorPath: /workflows/finemap_sva_sqtl.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
+
+  - subclass: WDL
+    name: FinemapSVApQTL
+    primaryDescriptorPath: /workflows/finemap_sva_pqtl.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
