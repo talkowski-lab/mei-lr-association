@@ -3,7 +3,6 @@ version 1.0
 import "concat_files_with_script.wdl" as ConcatFiles
 import "utils/build_file_map.wdl" as FileMapUtils
 import "utils/finemap_sva_tasks.wdl" as FinemapTasks
-import "https://raw.githubusercontent.com/AoU-Multiomics-Analysis/susieR/refs/heads/main/workflows/susieRonly.wdl" as susieRonly
 
 workflow FinemapSVAsQTL {
   input {
@@ -44,7 +43,7 @@ workflow FinemapSVAsQTL {
         GeneName = FeatureName
     }
 
-    call susieRonly.susieR as Susie {
+    call FinemapTasks.susieR as Susie {
       input:
         GenotypeDosages = GetSNVFM_Input.GenotypeDosages,
         GenotypeDosageIndex = GetSNVFM_Input.GenotypeDosagesIndex,
