@@ -9,6 +9,7 @@ task BuildFileMap {
   input {
     Array[String] Keys
     Array[Array[String]] Values
+    String OutputName
     String ImageTag = "latest"
     Int MemoryGB = 4
     Int? DiskGB
@@ -29,7 +30,7 @@ with open("~{values_json}") as f:
     columns = json.load(f)
 
 result = {key: [col[j] for col in columns] for j, key in enumerate(keys)}
-json.dump(result, open("manifest.json", "w"))
+json.dump(result, open("~{OutputName}", "w"))
 CODE
   >>>
 
@@ -43,6 +44,6 @@ CODE
   }
 
   output {
-    Map[String, Array[File]] FileMap = read_json("manifest.json")
+    File FileMap = OutputName
   }
 }

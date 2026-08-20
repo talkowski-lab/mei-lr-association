@@ -31,6 +31,7 @@ workflow FinemapSVAMultiomics {
     String? Prefix
 
     Float? PValueThreshold
+    Array[String]? FeatureSubset
     String? SubsetImageTag
     Int CisDistance = 1000000
     Int Memory = 64
@@ -49,6 +50,7 @@ workflow FinemapSVAMultiomics {
       PhenotypeBed = eQTL_PhenotypeBed,
       Prefix = Prefix,
       PValueThreshold = PValueThreshold,
+      FeatureSubset = FeatureSubset,
       SubsetImageTag = SubsetImageTag,
       CisDistance = CisDistance,
       Memory = Memory,
@@ -65,6 +67,7 @@ workflow FinemapSVAMultiomics {
       Covariates = sQTL_Covariates,
       Prefix = Prefix,
       PValueThreshold = PValueThreshold,
+      FeatureSubset = FeatureSubset,
       SubsetImageTag = SubsetImageTag,
       CisDistance = CisDistance,
       Memory = Memory,
@@ -81,6 +84,7 @@ workflow FinemapSVAMultiomics {
       Covariates = pQTL_Covariates,
       Prefix = Prefix,
       PValueThreshold = PValueThreshold,
+      FeatureSubset = FeatureSubset,
       SubsetImageTag = SubsetImageTag,
       CisDistance = CisDistance,
       Memory = Memory,
@@ -90,10 +94,10 @@ workflow FinemapSVAMultiomics {
 
   output {
     File eQTL_SusieParquet = eQTL_Run.SusieParquet
-    Map[String, Array[File]] eQTL_SusieAuxFiles = eQTL_Run.SusieAuxFiles
+    File eQTL_SusieAuxFiles = eQTL_Run.SusieAuxFiles
     File sQTL_SusieParquet = sQTL_Run.SusieParquet
-    Map[String, Array[File]] sQTL_SusieAuxFiles = sQTL_Run.SusieAuxFiles
+    File sQTL_SusieAuxFiles = sQTL_Run.SusieAuxFiles
     File pQTL_SusieParquet = pQTL_Run.SusieParquet
-    Map[String, Array[File]] pQTL_SusieAuxFiles = pQTL_Run.SusieAuxFiles
+    File pQTL_SusieAuxFiles = pQTL_Run.SusieAuxFiles
   }
 }

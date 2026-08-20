@@ -16,6 +16,7 @@ workflow FinemapSVAeQTL {
 
     String? Prefix
     Float? PValueThreshold
+    Array[String]? FeatureSubset
     String? SubsetImageTag
     Int CisDistance = 1000000
     Int Memory = 64
@@ -31,6 +32,7 @@ workflow FinemapSVAeQTL {
       QTLAssocSummary = AssocSummary,
       SVAGTBed = SVAGTBed,
       AVTable = AVTable,
+      FeatureSubset = FeatureSubset,
       PValueThreshold = PValueThreshold,
       Prefix = FM_Prefix,
       ImageTag = SubsetImageTag
@@ -75,11 +77,12 @@ workflow FinemapSVAeQTL {
   call FileMapUtils.BuildFileMap as SusieAuxFileMap {
     input:
       Keys = FeatureName,
-      Values = [Susie.lbfParquet, Susie.FullSusieParquet, Susie.VariantPositionSummary, Susie.SusieObject]
+      Values = [Susie.lbfParquet, Susie.FullSusieParquet, Susie.VariantPositionSummary, Susie.SusieObject],
+      OutputName = FM_Prefix + "_fm_files.json"
   }
 
   output {
     File SusieParquet = SusieParq_Concat.ConcatenatedFile
-    Map[String, Array[File]] SusieAuxFiles = SusieAuxFileMap.FileMap
+    File SusieAuxFiles = SusieAuxFileMap.FileMap
   }
 }

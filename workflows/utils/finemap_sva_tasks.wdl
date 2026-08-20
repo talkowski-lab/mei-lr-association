@@ -5,7 +5,10 @@ version 1.0
 # repeat-length BED to produce the list of significant pairs plus one wide
 # row per (variant, feature) combination. Also drops any feature not present
 # in the first column of AVTable (it would otherwise fail a per-feature
-# AVTable lookup downstream), reporting dropped features to stderr.
+# AVTable lookup downstream), reporting dropped features to stderr. If
+# FeatureSubset is set, the output is further restricted to just those
+# features, with any requested features not found among the significant
+# features reported to stderr.
 # If SignatureType is splice, the leafcutter feature is collapsed to its gene id.
 task SubsetSignificantSVAGT {
   input {
@@ -13,12 +16,15 @@ task SubsetSignificantSVAGT {
     File QTLAssocSummary
     File SVAGTBed
     File AVTable
+    Array[String]? FeatureSubset
     Float PValueThreshold = 0.01
     String Prefix = "sig_sva"
     String ImageTag = "latest"
     Int MemoryGB = 4
     Int? DiskGB
   }
+
+  File feature_subset_file = write_lines(select_first([FeatureSubset, []]))
 
   Int auto_disk_size = ceil(size([QTLAssocSummary, SVAGTBed, AVTable], "GB") * 2) + 10
 
@@ -29,6 +35,7 @@ task SubsetSignificantSVAGT {
         --qtl-assoc-summary ~{QTLAssocSummary} \
         --sva-gt-bed ~{SVAGTBed} \
         --avtable-file ~{AVTable} \
+        --feature-subset-file ~{feature_subset_file} \
         --signature-type ~{SignatureType} \
         --p-threshold ~{PValueThreshold} \
         --prefix ~{Prefix}

@@ -22,15 +22,19 @@ library(argparser)
 ## them, everywhere that gene appears.
 ##
 ## Also emits the significant pairs grouped by (bare) gene (parallel
-## feature_names.json / sva_ids.json arrays), for driving a per-gene scatter
-## downstream. Genes not present in the AVTable (first column) are dropped
-## -- they'd otherwise fail a per-gene AVTable lookup later -- and reported
-## to stderr.
+## feature_names.json / sva_ids.json arrays), for driving a per-feature
+## scatter downstream. Features not present in the AVTable (first column)
+## are dropped -- they'd otherwise fail a per-feature AVTable lookup later
+## -- and reported to stderr. If --feature-subset-file is given a non-empty
+## file (one feature ID per line), the output is further restricted to just
+## those features, with any requested features not found among the
+## significant features reported to stderr.
 
 argv <- arg_parser("Subset a QTL association summary to nominally significant SVA x feature pairs, and gather their genotype/repeat-length data") %>%
   add_argument("--qtl-assoc-summary", help = "nominal_association.R summary TSV (sva_id, feature, var_id, beta, p)") %>%
   add_argument("--sva-gt-bed", help = "Per-individual SVA genotype/repeat-length BED (e.g. ProcessMEISVAData matrix)") %>%
-  add_argument("--avtable-file", help = "Already-downloaded QTL data table TSV (id column first) -- genes not present here are dropped") %>%
+  add_argument("--avtable-file", help = "Already-downloaded QTL data table TSV (id column first) -- features not present here are dropped") %>%
+  add_argument("--feature-subset-file", help = "Optional file of feature IDs (one per line) to further restrict output to; empty or blank lines are ignored") %>%
   add_argument("--signature-type", help = "QTL signature type: 'expression', 'splice', or 'protein'") %>%
   add_argument("--p-threshold", help = "Nominal p-value cutoff for significance", default = 0.01) %>%
   add_argument("--prefix", help = "Output file prefix", default = "sig_sva") %>%
@@ -78,6 +82,20 @@ if (length(missing_genes) > 0) {
 
 sig_pairs <- sig_pairs %>%
   filter(bare_gene %in% avtable_ids)
+
+feature_subset <- read_lines(argv$feature_subset_file)
+feature_subset <- feature_subset[nzchar(feature_subset)]
+if (length(feature_subset) > 0) {
+  missing_subset_features <- setdiff(feature_subset, unique(sig_pairs$bare_gene))
+  if (length(missing_subset_features) > 0) {
+    message(glue(
+      "{length(missing_subset_features)} feature(s) in --feature-subset-file not found among significant features, skipping: ",
+      "{paste(missing_subset_features, collapse = ', ')}"
+    ))
+  }
+  sig_pairs <- sig_pairs %>%
+    filter(bare_gene %in% feature_subset)
+}
 
 sig_pairs %>%
   select(sva_id, feature) %>%
