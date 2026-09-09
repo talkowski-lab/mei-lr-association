@@ -170,3 +170,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: BedtoolsIntersect
+    primaryDescriptorPath: /workflows/bedtools_intersect.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
