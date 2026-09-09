@@ -43,15 +43,6 @@ def parse_args():
     parser.add_argument("--anchor-pad", type=int, default=100,
                         help="bp window around the BED interval within which an "
                              "insertion anchor is accepted.")
-    parser.add_argument("--flank-size", type=int, default=100,
-                        help="bp of reference sequence flanking each side of "
-                             "the insertion to also report methylation for. "
-                             "Only read bases that align to the reference "
-                             "are included -- an insertion elsewhere in the "
-                             "flank is skipped rather than padding it with "
-                             "extra read sequence -- so the reported flank "
-                             "may be shorter than this near a deletion or "
-                             "the end of the read/contig.")
     parser.add_argument("--mod-codes", default="m,h",
                         help="Comma-separated mod codes to keep (e.g. 'm,h').")
     parser.add_argument("--prob-threshold", type=float, default=0.5,
@@ -131,58 +122,6 @@ def summarize(calls, label, threshold):
     return len(probs), num_meth, mean_prob
 
 
-def ref_aligned_segments(read, ref_lo, ref_hi):
-    """Return ordered (q0, length) query segments aligned to [ref_lo, ref_hi).
-
-    Only CIGAR M/=/X ops count -- these are the only ops with a 1:1
-    ref:query mapping. An insertion contributes no reference positions so it
-    is skipped entirely; a deletion consumes reference positions with no
-    corresponding query base, so it just shortens the result. Concatenating
-    the query slices for the returned segments, in order, gives the read
-    bases that actually align to reference positions in the window.
-    """
-    segments = []
-    qpos = 0
-    rpos = read.reference_start
-    for op, length in read.cigartuples:
-        if op in (0, 7, 8):  # M, =, X
-            ov_lo, ov_hi = max(rpos, ref_lo), min(rpos + length, ref_hi)
-            if ov_lo < ov_hi:
-                segments.append((qpos + (ov_lo - rpos), ov_hi - ov_lo))
-        if op in CONSUME_QUERY:
-            qpos += length
-        if op in CONSUME_REF:
-            rpos += length
-        if rpos >= ref_hi:
-            break
-    return segments
-
-
-def calls_in_segments(read, segments, keep_codes):
-    """Like mods_in_span, but restricted to the union of query segments.
-
-    Offsets are into the sequence obtained by concatenating the segments in
-    order (i.e. the assembled flank sequence), not raw query_sequence index.
-    """
-    modified = read.modified_bases
-    if not modified:
-        return []
-    calls = []
-    cum = 0
-    for q0, length in segments:
-        for (_canon, _strand, mod_code), positions in modified.items():
-            if mod_code not in keep_codes:
-                continue
-            label = MOD_CODE_ALIASES.get(mod_code, str(mod_code))
-            for qpos, qual in positions:
-                if qual < 0 or not (q0 <= qpos < q0 + length):
-                    continue
-                calls.append((cum + (qpos - q0), label, (qual + 0.5) / 256.0))
-        cum += length
-    calls.sort()
-    return calls
-
-
 def region_stats(seq, calls, threshold):
     """Return the flat list of per-region columns shared by all three spans."""
     meth_string = ",".join(f"{lab}:{off}:{prob:.3f}" for off, lab, prob in calls)
@@ -203,19 +142,6 @@ def insertion_region(read, q0, q1, keep_codes, threshold):
     return region_stats(seq, calls, threshold)
 
 
-def flank_region(read, ref_lo, ref_hi, keep_codes, threshold):
-    """Region stats for a reference-coordinate window flanking the insertion.
-
-    Only bases that align to the reference within [ref_lo, ref_hi) are
-    included -- an insertion elsewhere in that window is skipped rather than
-    padding the flank with un-referenced read sequence.
-    """
-    segments = ref_aligned_segments(read, ref_lo, ref_hi)
-    seq = "".join(read.query_sequence[q0:q0 + length] for q0, length in segments)
-    calls = calls_in_segments(read, segments, keep_codes)
-    return region_stats(seq, calls, threshold)
-
-
 REGION_COLUMNS = [
     "length", "num_C",
     "num_5mC_calls", "num_5mC_methylated", "mean_5mC_prob",
@@ -227,8 +153,6 @@ COLUMNS = (
     ["locus_name", "chrom", "insertion_ref_pos", "read_name", "haplotype",
      "phase_set", "strand"]
     + [f"insertion_{c}" for c in REGION_COLUMNS]
-    + [f"upstream_{c}" for c in REGION_COLUMNS]
-    + [f"downstream_{c}" for c in REGION_COLUMNS]
 )
 
 
@@ -276,10 +200,6 @@ def main():
                      strand]
                     + insertion_region(read, q_start, q_start + ins_len,
                                        keep_codes, args.prob_threshold)
-                    + flank_region(read, anchor - args.flank_size + 1, anchor + 1,
-                                   keep_codes, args.prob_threshold)
-                    + flank_region(read, anchor + 1, anchor + 1 + args.flank_size,
-                                   keep_codes, args.prob_threshold)
                 )
 
     bam.close()

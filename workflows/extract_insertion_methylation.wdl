@@ -9,7 +9,6 @@ workflow ExtractInsertionMethylation {
         String ImageTag = "latest"
         Int LenTolerance = 100
         Int AnchorPad = 100
-        Int FlankSize = 100
         String ModCodes = "m,h"
         Float ProbThreshold = 0.5
     }
@@ -23,7 +22,6 @@ workflow ExtractInsertionMethylation {
             ImageTag = ImageTag,
             LenTolerance = LenTolerance,
             AnchorPad = AnchorPad,
-            FlankSize = FlankSize,
             ModCodes = ModCodes,
             ProbThreshold = ProbThreshold
     }
@@ -42,7 +40,6 @@ task ExtractMethylation {
         String ImageTag = "latest"
         Int LenTolerance = 100
         Int AnchorPad = 100
-        Int FlankSize = 100
         String ModCodes = "m,h"
         Float ProbThreshold = 0.5
     }
@@ -62,7 +59,6 @@ task ExtractMethylation {
             --prefix ~{Prefix} \
             --len-tolerance ~{LenTolerance} \
             --anchor-pad ~{AnchorPad} \
-            --flank-size ~{FlankSize} \
             --mod-codes ~{ModCodes} \
             --prob-threshold ~{ProbThreshold}
     >>>
