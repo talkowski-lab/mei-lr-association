@@ -179,3 +179,21 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: ProcessInsertionMethylation
+    primaryDescriptorPath: /workflows/process_insertion_methylation.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
+
+  - subclass: WDL
+    name: ProcessInsertionMethylationBatch
+    primaryDescriptorPath: /workflows/process_insertion_methylation_batch.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
