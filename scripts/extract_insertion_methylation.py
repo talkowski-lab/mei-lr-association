@@ -36,10 +36,10 @@ def parse_args():
     parser.add_argument("--prefix", required=True,
                         help="Output basename prefix; the table is written to "
                              "'<prefix>.insertion_methylation.tsv'.")
-    parser.add_argument("--len-tolerance", type=int, default=100,
-                        help="bp added on each side of each locus's "
+    parser.add_argument("--len-tolerance-perc", type=int, default=0.05,
+                        help="%age bp added on each side of each locus's "
                              "[min_len, max_len]; an insertion of length L is "
-                             "accepted when min_len - tol <= L <= max_len + tol.")
+                             "accepted when (1-perc) * min_len  <= L <= (1+perc)*max_len")
     parser.add_argument("--anchor-pad", type=int, default=100,
                         help="bp window around the BED interval within which an "
                              "insertion anchor is accepted.")
@@ -175,8 +175,8 @@ def main():
         for chrom, start, end, name, min_len, max_len in read_bed(args.loci_bed):
             lo = start - args.anchor_pad
             hi = end + args.anchor_pad
-            min_ins_len = max(1, min_len - args.len_tolerance)
-            max_ins_len = max_len + args.len_tolerance
+            min_ins_len = max(1, round(min_len * (1-args.len_tolerance_perc)))
+            max_ins_len = max_len * (1 + args.len_tolerance)
             for read in bam.fetch(chrom, max(0, lo), hi):
                 if read.is_unmapped or read.is_secondary or read.is_supplementary:
                     continue
