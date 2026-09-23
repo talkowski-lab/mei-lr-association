@@ -36,11 +36,11 @@ def parse_args():
     parser.add_argument("--prefix", required=True,
                         help="Output basename prefix; the table is written to "
                              "'<prefix>.insertion_methylation.tsv'.")
-    parser.add_argument("--len-tolerance-perc", type=int, default=0.05,
+    parser.add_argument("--len-tolerance-perc", type=float, default=0.05,
                         help="%age bp added on each side of each locus's "
                              "[min_len, max_len]; an insertion of length L is "
                              "accepted when (1-perc) * min_len  <= L <= (1+perc)*max_len")
-    parser.add_argument("--anchor-pad", type=int, default=100,
+    parser.add_argument("--anchor-pad", type=int, default=50,
                         help="bp window around the BED interval within which an "
                              "insertion anchor is accepted.")
     parser.add_argument("--mod-codes", default="m,h",

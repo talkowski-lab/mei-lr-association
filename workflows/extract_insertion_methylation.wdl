@@ -7,8 +7,8 @@ workflow ExtractInsertionMethylation {
         File LociBed
         String Prefix
         String ImageTag = "latest"
-        Int LenTolerance = 100
-        Int AnchorPad = 100
+        Float LenTolerancePerc = 0.05
+        Int AnchorPad = 50
         String ModCodes = "m,h"
         Float ProbThreshold = 0.5
     }
@@ -20,7 +20,7 @@ workflow ExtractInsertionMethylation {
             LociBed = LociBed,
             Prefix = Prefix,
             ImageTag = ImageTag,
-            LenTolerance = LenTolerance,
+            LenTolerancePerc = LenTolerancePerc,
             AnchorPad = AnchorPad,
             ModCodes = ModCodes,
             ProbThreshold = ProbThreshold
@@ -38,8 +38,8 @@ task ExtractMethylation {
         File LociBed
         String Prefix
         String ImageTag = "latest"
-        Int LenTolerance = 100
-        Int AnchorPad = 100
+        Float LenTolerancePerc = 0.05
+        Int AnchorPad = 50
         String ModCodes = "m,h"
         Float ProbThreshold = 0.5
     }
@@ -57,7 +57,7 @@ task ExtractMethylation {
             --bam input.bam \
             --loci-bed ~{LociBed} \
             --prefix ~{Prefix} \
-            --len-tolerance ~{LenTolerance} \
+            --len-tolerance-perc ~{LenTolerancePerc} \
             --anchor-pad ~{AnchorPad} \
             --mod-codes ~{ModCodes} \
             --prob-threshold ~{ProbThreshold}
