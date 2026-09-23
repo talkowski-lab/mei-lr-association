@@ -197,3 +197,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: ProcessMethylationWindow
+    primaryDescriptorPath: /workflows/process_methylation_window.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
