@@ -76,14 +76,20 @@ workflow ProcessInsertionMethylationBatch {
             input:
                 InputFiles = SummarizeInsertionMethylationBatch.DataSummFiles,
                 OutputName = "batch_" + batch_idx + ".ins_methyl_data_summ.tsv",
-                ImageTag = ImageTag
+                ImageTag = ImageTag,
+                AddIdColumn = true,
+                Ids = batch_indiv,
+                NewIdColumnName = "indiv"
         }
 
         call ConcatFiles.ConcatenateDelim as ConcatBatchHapSumm {
             input:
                 InputFiles = SummarizeInsertionMethylationBatch.HapSummFiles,
                 OutputName = "batch_" + batch_idx + ".ins_methyl_hap_summ.tsv",
-                ImageTag = ImageTag
+                ImageTag = ImageTag,
+                AddIdColumn = true,
+                Ids = batch_indiv,
+                NewIdColumnName = "indiv"
         }
     }
 

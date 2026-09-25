@@ -95,16 +95,25 @@ def mods_in_span(read, q0, q1, keep_codes):
     Uses read.modified_bases, whose positions index query_sequence -- the same
     frame as the CIGAR-derived offsets. Probability = (qual + 0.5) / 256;
     qual == -1 means no call and is dropped.
+
+    Forward-strand reads need a +1 correction here: pysam/htslib's MM-tag
+    decoder has separate code paths for forward- vs reverse-strand
+    alignments when converting the tag's skip-counts into query_sequence
+    positions, and forward-strand positions come out 1bp short (verified
+    against known-unambiguous single-C contexts). Reverse-strand reads are
+    unaffected.
     """
     calls = []
     modified = read.modified_bases
     if not modified:
         return calls
+    fwd_offset = 0 if read.is_reverse else 1
     for (_canon, _strand, mod_code), positions in modified.items():
         if mod_code not in keep_codes:
             continue
         label = MOD_CODE_ALIASES.get(mod_code, str(mod_code))
         for qpos, qual in positions:
+            qpos += fwd_offset
             if qual < 0 or not (q0 <= qpos < q1):
                 continue
             calls.append((qpos - q0, label, (qual + 0.5) / 256.0))

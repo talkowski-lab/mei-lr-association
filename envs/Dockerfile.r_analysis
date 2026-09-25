@@ -6,7 +6,7 @@ FROM rocker/verse:4.4.1
 ## via install.packages() silently no-ops (it only warns on missing packages,
 ## it doesn't fail the build), so they must go through BiocManager instead.
 RUN R -e "install.packages(c('optparse', 'argparser', 'jsonlite', 'data.table', 'ggplot2', 'ggthemes', 'glue', 'arrow', 'stringdist', 'BiocManager'), repos = 'https://cloud.r-project.org')" \
-    && R -e "BiocManager::install(c('Biostrings', 'GenomicRanges', 'AnVIL', 'AnVILGCP'), update = FALSE, ask = FALSE)"
+    && R -e "BiocManager::install(c('Biostrings', 'DECIPHER', 'GenomicRanges', 'AnVIL', 'AnVILGCP'), update = FALSE, ask = FALSE)"
 
 ## Build samtools/bcftools from source with --enable-libcurl so htslib's remote
 ## file support can read gs:// (and s3://) URLs directly, not just local paths.
