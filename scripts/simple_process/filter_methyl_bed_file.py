@@ -24,7 +24,7 @@ df = df.with_columns(
     distance = pl.when(c("dist1").sign() * c("dist2").sign() == -1).then(0).otherwise(c("dist1").sign() * pl.min_horizontal(c("dist1").abs(), c("dist2").abs()))
   )
 
-df = df.drop("dist1", "dist2", "_chrom", "_start", "_end", "var_start", "var_end").filter(c("distance").abs() <= 100)
+df = df.drop("dist1", "dist2", "_chrom", "_start", "_end", "var_start", "var_end").filter(c("distance").abs() <= 500)
 
 df.write_csv(sys.stdout, separator=os.environ["DELIMITER"])
 
