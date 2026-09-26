@@ -185,7 +185,7 @@ def main():
             lo = start - args.anchor_pad
             hi = end + args.anchor_pad
             min_ins_len = max(1, round(min_len * (1-args.len_tolerance_perc)))
-            max_ins_len = max_len * (1 + args.len_tolerance)
+            max_ins_len = max_len * (1 + args.len_tolerance_perc)
             for read in bam.fetch(chrom, max(0, lo), hi):
                 if read.is_unmapped or read.is_secondary or read.is_supplementary:
                     continue
