@@ -206,3 +206,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: IndividualVariantBedFromLongGenotypes
+    primaryDescriptorPath: /workflows/individual_variant_bed_from_long_genotypes.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
