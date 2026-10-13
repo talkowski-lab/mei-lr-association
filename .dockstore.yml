@@ -215,3 +215,21 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: CombineAndWindowVariants
+    primaryDescriptorPath: /workflows/combine_and_window_variants.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
+
+  - subclass: WDL
+    name: SVAMEIMethylationWindows
+    primaryDescriptorPath: /workflows/sva_mei_methylation_windows.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/

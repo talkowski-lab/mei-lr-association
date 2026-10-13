@@ -30,9 +30,11 @@ def parse_args():
                         help="Indexed, haplotagged modBAM (.bai co-located).")
     parser.add_argument("--loci-bed", required=True,
                         help="BED of insertion loci: chrom, start, end, name, "
-                             "min_len, max_len. min_len/max_len bound the "
-                             "expected insertion length (bp); the accepted range "
-                             "is widened by --len-tolerance on each side.")
+                             "score, strand, min_len, max_len (the MEI bed "
+                             "layout -- score/strand are ignored here). "
+                             "min_len/max_len bound the expected insertion "
+                             "length (bp); the accepted range is widened by "
+                             "--len-tolerance on each side.")
     parser.add_argument("--prefix", required=True,
                         help="Output basename prefix; the table is written to "
                              "'<prefix>.insertion_methylation.tsv'.")
@@ -53,8 +55,10 @@ def parse_args():
 def read_bed(path):
     """Yield (chrom, start, end, name, min_len, max_len), skipping headers.
 
-    Expects at least 6 columns: chrom, start, end, name, min_len, max_len.
-    min_len/max_len bound the expected insertion length in bp.
+    Expects at least 8 columns, the MEI bed layout: chrom, start, end, name,
+    score, strand, min_len, max_len. score/strand (columns 5/6) are present
+    in this layout but unused here; min_len/max_len bound the expected
+    insertion length in bp.
     """
     with open(path) as inf:
         for i, line in enumerate(inf, start=1):
@@ -62,13 +66,14 @@ def read_bed(path):
             if not line or line.startswith(("#", "track", "browser")):
                 continue
             fields = line.split("\t") if "\t" in line else line.split()
-            if len(fields) < 6:
+            if len(fields) < 8:
                 raise ValueError(
-                    f"{path} line {i}: expected >=6 columns (chrom, start, end, "
-                    f"name, min_len, max_len), got {len(fields)}: {line!r}")
+                    f"{path} line {i}: expected >=8 columns (chrom, start, end, "
+                    f"name, score, strand, min_len, max_len), got {len(fields)}: "
+                    f"{line!r}")
             chrom, start, end = fields[0], int(fields[1]), int(fields[2])
             name = fields[3] if fields[3] else f"{chrom}:{start}-{end}"
-            min_len, max_len = int(fields[4]), int(fields[5])
+            min_len, max_len = int(fields[6]), int(fields[7])
             yield chrom, start, end, name, min_len, max_len
 
 

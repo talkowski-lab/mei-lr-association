@@ -1,5 +1,9 @@
 version 1.0
 
+## LociBed is the MEI bed layout: chrom, start, end, var_id, score, strand,
+## min_length, max_length. score/strand are carried in the file but unused
+## here -- only min_length/max_length (columns 7/8) bound the expected
+## insertion length.
 workflow ExtractInsertionMethylation {
     input {
         File Bam

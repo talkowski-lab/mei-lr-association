@@ -45,3 +45,12 @@ Thumbs.db
 .idea/
 .vscode/
 *~
+
+# nbsync (holds the Terra workspace bucket name / local sync state)
+notebooks/
+.nbsync.secret
+.nbsync_state.json
+notebooks/.ipynb_checkpoints/
+
+# LLM outputs
+.claude/worktrees
