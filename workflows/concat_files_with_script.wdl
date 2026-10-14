@@ -12,7 +12,14 @@ import "utils/concat_files.wdl" as ConcatFiles
 ## ID-column options below. "parquet" uses ConcatParquet -- a plain vertical
 ## concat of Parquet files with the same schema; none of the delim-only
 ## options (HasHeader, GzipOutput, RemoteScript, EmbeddedScriptPath,
-## AddIdColumn, Ids, NewIdColumnName, Delimiter) apply in that mode.
+## AddIdColumn, Ids, NewIdColumnName, FilterColumn, FilterValues,
+## FilterValuesFile, Delimiter) apply in that mode. FilterColumn (1-based),
+## together with FilterValues and/or FilterValuesFile (one allowed value per
+## line; both are unioned if both are given), keeps only rows whose
+## FilterColumn value is in that allow-list.
+## "delim_to_parquet" reads delimited text (same options as "delim", via
+## ConcatenateDelim), then converts each batch's concatenated output to
+## Parquet via DelimToParquet before merging batches with ConcatParquet.
 ##
 ## RemoteScript (a File, e.g. a gs:// path -- localized by Cromwell like any
 ## other File input) and EmbeddedScriptPath (a path already baked into the
@@ -51,6 +58,9 @@ workflow ConcatenateAndProcessFiles {
     Boolean? AddIdColumn
     Array[String]? Ids
     String? NewIdColumnName
+    Int? FilterColumn
+    Array[String]? FilterValues
+    File? FilterValuesFile
     String? Delimiter
     String? OutputName
     String? ImageTag
@@ -95,7 +105,7 @@ workflow ConcatenateAndProcessFiles {
         }
       }
 
-      if (FileType == "delim") {
+      if (FileType == "delim" || FileType == "delim_to_parquet") {
         call ConcatFiles.ConcatenateDelim as ConcatenateBatchDelim {
           input:
             InputFiles = batch_file,
@@ -106,6 +116,9 @@ workflow ConcatenateAndProcessFiles {
             AddIdColumn = AddIdColumn,
             Ids = batch_id_elem,
             NewIdColumnName = NewIdColumnName,
+            FilterColumn = FilterColumn,
+            FilterValues = FilterValues,
+            FilterValuesFile = FilterValuesFile,
             Delimiter = Delimiter,
             OutputName = "batch_" + batch_idx + ".txt",
             ImageTag = ImageTag,
@@ -126,7 +139,20 @@ workflow ConcatenateAndProcessFiles {
         }
       }
 
-      File batch_output = select_first([ConcatenateBatchDelim.ConcatenatedFile, ConcatenateBatchParquet.ConcatenatedFile])
+      if (FileType == "delim_to_parquet") {
+        call ConcatFiles.DelimToParquet as ConvertBatchToParquet {
+          input:
+            InputFile = select_first([ConcatenateBatchDelim.ConcatenatedFile]),
+            HasHeader = HasHeader,
+            Delimiter = Delimiter,
+            OutputName = "batch_" + batch_idx + ".parquet",
+            ImageTag = ImageTag,
+            CPU = BatchCPU,
+            MemoryGB = BatchMemoryGB
+        }
+      }
+
+      File batch_output = select_first([ConvertBatchToParquet.ConcatenatedFile, ConcatenateBatchParquet.ConcatenatedFile, ConcatenateBatchDelim.ConcatenatedFile])
     }
 
     # Batch outputs already have (at most) one header each and their rows are
@@ -147,7 +173,7 @@ workflow ConcatenateAndProcessFiles {
       }
     }
 
-    if (FileType == "parquet") {
+    if (FileType == "parquet" || FileType == "delim_to_parquet") {
       call ConcatFiles.ConcatParquet as MergeBatchesParquet {
         input:
           InputFiles = batch_output,
@@ -160,19 +186,22 @@ workflow ConcatenateAndProcessFiles {
   }
 
   if (!defined(BatchSize)) {
-    if (FileType == "delim") {
+    if (FileType == "delim" || FileType == "delim_to_parquet") {
       call ConcatFiles.ConcatenateDelim as ConcatenateSingleDelim {
         input:
           InputFiles = InputFiles,
           HasHeader = HasHeader,
-          GzipOutput = GzipOutput,
+          GzipOutput = if (FileType == "delim_to_parquet") then false else GzipOutput,
           RemoteScript = RemoteScript,
           EmbeddedScriptPath = EmbeddedScriptPath,
           AddIdColumn = AddIdColumn,
           Ids = Ids,
           NewIdColumnName = NewIdColumnName,
+          FilterColumn = FilterColumn,
+          FilterValues = FilterValues,
+          FilterValuesFile = FilterValuesFile,
           Delimiter = Delimiter,
-          OutputName = OutputName,
+          OutputName = if (FileType == "delim_to_parquet") then "concatenated.txt" else OutputName,
           ImageTag = ImageTag,
           CPU = BatchCPU,
           MemoryGB = BatchMemoryGB
@@ -189,12 +218,26 @@ workflow ConcatenateAndProcessFiles {
           MemoryGB = BatchMemoryGB
       }
     }
+
+    if (FileType == "delim_to_parquet") {
+      call ConcatFiles.DelimToParquet as ConvertSingleToParquet {
+        input:
+          InputFile = select_first([ConcatenateSingleDelim.ConcatenatedFile]),
+          HasHeader = HasHeader,
+          Delimiter = Delimiter,
+          OutputName = OutputName,
+          ImageTag = ImageTag,
+          CPU = BatchCPU,
+          MemoryGB = BatchMemoryGB
+      }
+    }
   }
 
   output {
     File ConcatenatedFile = select_first([
       MergeBatchesDelim.ConcatenatedFile,
       MergeBatchesParquet.ConcatenatedFile,
+      ConvertSingleToParquet.ConcatenatedFile,
       ConcatenateSingleDelim.ConcatenatedFile,
       ConcatenateSingleParquet.ConcatenatedFile
     ])

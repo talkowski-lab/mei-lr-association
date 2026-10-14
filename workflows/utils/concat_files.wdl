@@ -10,6 +10,9 @@ task ConcatenateDelim {
     Boolean AddIdColumn = false
     Array[String]? Ids
     String NewIdColumnName = "id"
+    Int? FilterColumn
+    Array[String]? FilterValues
+    File? FilterValuesFile
     String Delimiter = "\t"
     String OutputName = "concatenated.tsv"
     String ImageTag = "latest"
@@ -18,10 +21,12 @@ task ConcatenateDelim {
     Int? DiskGB
   }
 
-  # Ids is Array[String] (never File), so it's safe to write out here regardless
-  # of localization timing. InputFiles is NOT handled this way -- see the manifest
-  # built inline in the command block below, and the comment there for why.
+  # Ids/FilterValues are Array[String] (never File), so it's safe to write them
+  # out here regardless of localization timing. InputFiles is NOT handled this
+  # way -- see the manifest built inline in the command block below, and the
+  # comment there for why.
   File id_manifest = write_lines(select_first([Ids, []]))
+  File filter_values_manifest = write_lines(select_first([FilterValues, []]))
 
   # Only append .gz if OutputName doesn't already end with it, so callers who
   # already anticipated gzipping (e.g. OutputName = "concatenated.tsv.gz")
@@ -30,7 +35,7 @@ task ConcatenateDelim {
   String FinalOutputName = if GzipOutput && !output_already_has_gz_suffix then OutputName + ".gz" else OutputName
   Boolean AppendedGzSuffix = FinalOutputName != OutputName
 
-  Int auto_disk_size = ceil((size(InputFiles, "GiB") + size(RemoteScript, "GiB")) * 3) + 10
+  Int auto_disk_size = ceil((size(InputFiles, "GiB") + size(RemoteScript, "GiB") + size(FilterValuesFile, "GiB")) * 3) + 10
 
   command <<<
     set -euo pipefail
@@ -45,6 +50,8 @@ task ConcatenateDelim {
     export GZIP_OUTPUT='~{GzipOutput}'
     export ADD_ID_COLUMN='~{AddIdColumn}'
     export ID_COLUMN_NAME='~{NewIdColumnName}'
+    export FILTER_COLUMN='~{"" + FilterColumn}'
+    export FILTER_VALUES_FILE='~{"" + FilterValuesFile}'
     export DELIMITER='~{Delimiter}'
     export OUT_PATH='~{FinalOutputName}'
     export ORIGINAL_OUTPUT_NAME='~{OutputName}'
@@ -71,6 +78,7 @@ has_header = os.environ["HAS_HEADER"] == "true"
 gzip_output = os.environ["GZIP_OUTPUT"] == "true"
 add_id_column = os.environ["ADD_ID_COLUMN"] == "true"
 id_col_name = os.environ["ID_COLUMN_NAME"]
+filter_column = int(os.environ["FILTER_COLUMN"]) if os.environ["FILTER_COLUMN"] else None
 delim = os.environ["DELIMITER"]
 remote_script_path = os.environ.get("REMOTE_SCRIPT_PATH") or None
 embedded_script_path = os.environ.get("EMBEDDED_SCRIPT_PATH") or None
@@ -93,6 +101,14 @@ if ids and len(ids) != len(files):
     raise ValueError(
         f"Length of Ids ({len(ids)}) does not match length of InputFiles ({len(files)})"
     )
+
+with open("~{filter_values_manifest}") as f:
+    filter_values = set(line.strip() for line in f if line.strip())
+
+filter_values_file_path = os.environ.get("FILTER_VALUES_FILE") or None
+if filter_values_file_path:
+    with open(filter_values_file_path) as f:
+        filter_values.update(line.strip() for line in f if line.strip())
 
 # RemoteScript and EmbeddedScriptPath are mutually exclusive; RemoteScript
 # wins if both are set. Neither set means no preprocessing at all.
@@ -143,12 +159,55 @@ with out_f_cm as out_f:
                 writer.writerow(out_header)
 
         for row in data_rows:
+            if filter_column is not None and row[filter_column - 1] not in filter_values:
+                continue
             writer.writerow([row_id] + row if add_id_column else row)
 CODE
   >>>
 
   output {
     File ConcatenatedFile = "~{FinalOutputName}"
+  }
+
+  runtime {
+    docker: "ayenkin1871/mei-lr-association-python_general:" + ImageTag
+    cpu: CPU
+    memory: MemoryGB + " GB"
+    disks: "local-disk " + select_first([DiskGB, auto_disk_size]) + " SSD"
+    preemptible: 3
+    maxRetries: 2
+  }
+}
+
+## Converts one delimited text file to Parquet via polars' CSV reader.
+task DelimToParquet {
+  input {
+    File InputFile
+    Boolean HasHeader = true
+    String Delimiter = "\t"
+    String OutputName = "converted.parquet"
+    String ImageTag = "latest"
+    Int CPU = 2
+    Int MemoryGB = 4
+    Int? DiskGB
+  }
+
+  Int auto_disk_size = ceil(size(InputFile, "GiB") * 3) + 10
+
+  command <<<
+    set -euo pipefail
+
+    python3 <<CODE
+import polars as pl
+
+has_header = "~{HasHeader}" == "true"
+df = pl.read_csv("~{InputFile}", separator="~{Delimiter}", has_header=has_header)
+df.write_parquet("~{OutputName}")
+CODE
+  >>>
+
+  output {
+    File ConcatenatedFile = OutputName
   }
 
   runtime {
