@@ -5,39 +5,24 @@ import "bedtools_intersect.wdl" as BedtoolsIntersect
 import "process_methylation_window.wdl" as ProcessMethylationWindow
 import "utils/concat_files.wdl" as ConcatFiles
 
-## End-to-end pipeline from a reference-SVA bed and an MEI bed, plus one
-## individual's phased methylation beds (hap1/hap2), to a 100bp-binned
-## methylation-by-distance-from-variant summary:
-##
-## 1. CombineAndWindowVariants: concatenates SVABed+MEIBed and flanks each
-##    variant by FlankSize on each side (clamped to chromosome bounds),
-##    carrying the original coordinates and strand through as extra columns.
-## 2. BedtoolsIntersect (called once per haplotype): intersects each of
-##    Hap1MethylBed/Hap2MethylBed against the windowed variant bed (`-wa -wb`
-##    so both sides' columns are kept).
-## 3. ProcessMethylationWindow (called once per haplotype, independently):
-##    bins each haplotype's intersect bed into 100bp tiles by signed
-##    distance from its variant and summarizes per (variant, haplotype,
-##    distance bin) -- haplotype grouping comes from the methylation bed's
-##    own embedded column, not from which file it was. Summarizing per-
-##    haplotype before concatenating (rather than concatenating the raw
-##    intersect beds first) keeps ProcessMethylationWindow decoupled from how
-##    many haplotype files there are -- it can equally be run standalone on a
-##    single combined/unphased methylation bed later.
-## 4. ConcatFiles.ConcatenateDelim: concatenates the two per-haplotype
-##    summary TSVs (each already has a header and a `haplotype` column) into
-##    one final table.
+## End-to-end pipeline from a reference-SVA bed, an MEI bed, and a third bed
+## (same format as the MEI bed), plus one individual's phased methylation
+## beds (hap1/hap2), to a fixed-width-binned methylation-by-distance-from-
+## variant summary: CombineAndWindowVariants -> BedtoolsIntersect (once per
+## haplotype) -> ProcessMethylationWindow (once per haplotype) ->
+## ConcatFiles.ConcatenateDelim.
 
 workflow SVAMEIMethylationWindows {
     input {
         File SVABed
         File MEIBed
+        File OtherBed
         File ChromSizes
         File Hap1MethylBed
         File Hap2MethylBed
         String Individual
-        Int FlankSize = 10000
-        Int BinSize = 100
+        Int FlankSize = 5000
+        Int BinSize = 200
         String ImageTag = "latest"
         String BedtoolsDockerImage = "quay.io/biocontainers/bedtools:2.31.1--hf5e1c6e_1"
     }
@@ -46,6 +31,7 @@ workflow SVAMEIMethylationWindows {
         input:
             SVABed = SVABed,
             MEIBed = MEIBed,
+            OtherBed = OtherBed,
             ChromSizes = ChromSizes,
             FlankSize = FlankSize,
             Prefix = Individual,

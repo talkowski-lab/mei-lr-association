@@ -30,11 +30,10 @@ def parse_args():
                         help="Indexed, haplotagged modBAM (.bai co-located).")
     parser.add_argument("--loci-bed", required=True,
                         help="BED of insertion loci: chrom, start, end, name, "
-                             "score, strand, min_len, max_len (the MEI bed "
-                             "layout -- score/strand are ignored here). "
-                             "min_len/max_len bound the expected insertion "
-                             "length (bp); the accepted range is widened by "
-                             "--len-tolerance on each side.")
+                             "score, strand, min_len, max_len. min_len/max_len "
+                             "bound the expected insertion length (bp); the "
+                             "accepted range is widened by --len-tolerance on "
+                             "each side.")
     parser.add_argument("--prefix", required=True,
                         help="Output basename prefix; the table is written to "
                              "'<prefix>.insertion_methylation.tsv'.")
@@ -55,10 +54,8 @@ def parse_args():
 def read_bed(path):
     """Yield (chrom, start, end, name, min_len, max_len), skipping headers.
 
-    Expects at least 8 columns, the MEI bed layout: chrom, start, end, name,
-    score, strand, min_len, max_len. score/strand (columns 5/6) are present
-    in this layout but unused here; min_len/max_len bound the expected
-    insertion length in bp.
+    Expects at least 8 columns: chrom, start, end, name, score, strand,
+    min_len, max_len.
     """
     with open(path) as inf:
         for i, line in enumerate(inf, start=1):

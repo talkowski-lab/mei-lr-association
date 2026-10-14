@@ -2,12 +2,7 @@ version 1.0
 
 # Given a gzipped sparse long-form genotype table with columns including
 # `indiv` and `var_id`, emit the subset of a variant BED whose name column is
-# present in `var_id` for one requested individual. Rows are emitted
-# unmodified (the whole matching line, via awk's bare `print`), so whatever
-# columns VariantsBed carries in their normal places -- e.g. the reference-
-# SVA/MEI bed layout's score (column 5) and strand (column 6) -- are
-# preserved as-is in the output bed, not just the name column being matched
-# on.
+# present in `var_id` for one requested individual.
 workflow IndividualVariantBedFromLongGenotypes {
     input {
         File GenotypeTable
