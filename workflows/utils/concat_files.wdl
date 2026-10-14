@@ -249,8 +249,7 @@ out_path = "~{OutputName}"
 with open("input_files_manifest.txt") as f:
     files = [line.strip() for line in f if line.strip()]
 
-df = pl.concat([pl.read_parquet(fp) for fp in files], how="vertical")
-df.write_parquet(out_path)
+pl.concat([pl.scan_parquet(fp) for fp in files], how="vertical").sink_parquet(out_path)
 CODE
   >>>
 
