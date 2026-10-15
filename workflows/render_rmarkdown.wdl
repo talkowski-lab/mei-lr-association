@@ -4,7 +4,9 @@ version 1.0
 ## Rmd itself writes into FiguresDir/TablesDir. The Rmd is copied to the task's
 ## working directory (along with any InputData and RScripts files) before
 ## rendering, so it can refer to those files and to FiguresDir/TablesDir by
-## relative path.
+## relative path. Bucket (if given) is exported as the GCLOUD_BUCKET env var,
+## for Rmds that build gs:// URIs from it (e.g. via gs_download/gs_upload
+## helpers) instead of relying on an AnVIL/Terra workspace.
 
 workflow RenderRmarkdownReport {
   input {
@@ -17,6 +19,7 @@ workflow RenderRmarkdownReport {
     String DockerImage = "ayenkin1871/mei-lr-association-r_analysis:latest"
     Map[String, String] RenderParams = {}
     Boolean ContinueOnChunkError = false
+    String? Bucket
     Int MemoryGB = 8
     Int CPU = 2
     Int? DiskGB
@@ -33,6 +36,7 @@ workflow RenderRmarkdownReport {
       DockerImage = DockerImage,
       RenderParams = RenderParams,
       ContinueOnChunkError = ContinueOnChunkError,
+      Bucket = Bucket,
       MemoryGB = MemoryGB,
       CPU = CPU,
       DiskGB = DiskGB
@@ -57,6 +61,7 @@ task RenderReport {
     String DockerImage
     Map[String, String] RenderParams
     Boolean ContinueOnChunkError
+    String? Bucket
     Int MemoryGB
     Int CPU
     Int? DiskGB
@@ -81,6 +86,7 @@ task RenderReport {
 
     export FIGURES_DIR=~{FiguresDir}
     export TABLES_DIR=~{TablesDir}
+    export GCLOUD_BUCKET=~{select_first([Bucket, ""])}
 
     cp ~{RmdFile} report.Rmd
 

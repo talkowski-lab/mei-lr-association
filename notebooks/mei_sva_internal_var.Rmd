@@ -1,0 +1,1064 @@
+---
+title: Title
+author: Name
+date: Date
+---
+
+
+```{r setup}
+library(AnVIL)
+library(AnVILGCP)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(Biostrings)
+library(glue)
+library(ggplot2)
+library(ggthemes)
+source("utils.R")
+gc_bucket <- Sys.getenv("GCLOUD_BUCKET")
+set_gcloud_bucket(gc_bucket)
+```
+
+# Download metadata
+```{r load-gene-constraint-metadata}
+# TODO: these ref/ files aren't present on this VM. On Terra they'd be synced from the
+# workspace bucket automatically; here they need to be gsutil cp'd down first (this VM also
+# isn't an AnVIL workspace, which is why avworkspace_namespace() fails in the next chunk)
+omim_gm <- gs_download(glue("gs://"))
+  read_delim("ref/genemap2.txt", delim="\t", skip=3)
+loeuf_percs <- read_delim("ref/gnomad.v4.1.1.loeuf_percentile_thresholds.tsv") %>%
+  filter(granularity == "percentile")
+
+loeuf_df <- read_delim("ref/gnomad.v4.1.1.constraint_metrics.tsv.bgz") %>%
+  filter(mane_select) %>%
+  filter(startsWith(gene_id, "ENSG")) %>%
+  select(gene_name=gene, gene_id_simple=gene_id, LOEUF=lof.oe_ci.upper) %>%
+  mutate(
+    LOEUF_perc = findInterval(LOEUF, loeuf_percs$threshold)
+  )
+```
+
+# Download MEI data
+```{r download-mei-bed-files}
+# Get the BED File with SVA genotypes
+sva_bed_df <- gs_download("scratch/yulia/l1meaid_intactmei_annotations.bcftoolsmerge.wholegenome.phaseII.FILTERED.ori_intact_anno.SVA.clustered.bed") %>%
+  read_delim(col_names=c("chrom", "start", "end", "REF", "ALT", "ID", "MEI_type", "MEI_subfamily", "length", "orientation", "intact_status", "cluster_id")) %>%
+  mutate(sva_id = paste0("SVA_MEI_cl", sprintf("%05d", cluster_id)))  %>%
+  mutate(ALT_md5 = sapply(ALT, digest, algo="md5", serialize=FALSE))
+
+alu_bed_df <- gs_download("scratch/yulia/l1meaid_intactmei_annotations.bcftoolsmerge.wholegenome.phaseII.FILTERED.ori_intact_anno.ALU.clustered.bed") %>%
+  read_delim(col_names=c("chrom", "start", "end", "REF", "ALT", "ID", "MEI_type", "MEI_subfamily", "length", "orientation", "intact_status", "cluster_id") ) %>%
+  mutate(var_id = paste0("Alu_MEI_cl", sprintf("%05d", cluster_id)))  %>%
+  mutate(ALT_md5 = sapply(ALT, digest, algo="md5", serialize=FALSE))
+
+line1_bed_df <- gs_download("scratch/yulia/l1meaid_intactmei_annotations.bcftoolsmerge.wholegenome.phaseII.FILTERED.ori_intact_anno.LINE.clustered.bed") %>%
+  read_delim(col_names=c("chrom", "start", "end", "REF", "ALT", "ID", "MEI_type", "MEI_subfamily", "length", "orientation", "intact_status", "cluster_id"))   %>%
+  mutate(var_id = paste0("LINE1_MEI_cl", sprintf("%05d", cluster_id)))  %>%
+  mutate(ALT_md5 = sapply(ALT, digest, algo="md5", serialize=FALSE))
+
+sva_bed_df %>% head()
+
+View(sva_bed_df)
+
+```
+
+```{r build-sva-fasta}
+# Get Fasta File
+sva_bed_df <- sva_bed_df %>% 
+  mutate(final_DNA = if_else(orientation == "-", as.character(reverseComplement(DNAStringSet(ALT))), ALT)) %>%
+  mutate(id_n = 1:n()) %>%
+  mutate(sva_id = paste0("SVA_MEI_cl", sprintf("%05d", cluster_id))) %>%
+  mutate(fastaheader=glue("{chrom}:{start}-{end}:{ALT_md5}")) 
+  
+
+nrow(sva_bed_df)
+sva_bed_df %>% select(chrom, start, end, ID, cluster_id, ALT) %>% distinct() %>% nrow()
+
+sva_bed_df %>%
+  filter(orientation != "NONE") %>%
+  mutate(fastaentry=glue(">{fastaheader}\n{final_DNA}")) %>%
+  pull(fastaentry) %>%
+  writeLines("mei_sva_clustered_seqs.fasta")
+gs_upload("mei_sva_clustered_seqs.fasta", "scratch/alex/sva_seqs")
+
+top5_uniq_clusters <- sva_bed_df %>%
+  group_by(cluster_id) %>%
+  tally(sort=TRUE) %>%
+  slice_head(n=5) %>%
+  pull(cluster_id)
+
+top100_uniq_clusters <- sva_bed_df %>% 
+  group_by(cluster_id) %>%
+  tally(sort=TRUE) %>%
+  slice_head(n=100) %>%
+  pull(cluster_id)
+
+sva_bed_df %>%
+  filter(cluster_id %in% top5_uniq_clusters) %>%
+  mutate(fastaentry=glue(">{fastaheader}\n{final_DNA}")) %>%
+  pull(fastaentry) %>%
+  writeLines("mei_sva_clustered_seqs_top5variable.fasta")
+#gs_upload("mei_sva_clustered_seqs_top5variable.fasta", "scratch/alex/sva_seqs")
+
+sva_bed_df %>%
+  filter(cluster_id %in% top_uniq_clusters) %>%
+  mutate(fastaentry=glue(">{fastaheader}\n{final_DNA}")) %>%
+  pull(fastaentry) %>%
+  writeLines("mei_sva_clustered_seqs_topvariable.fasta")
+gs_upload("mei_sva_clustered_seqs_topvariable.fasta", "scratch/alex/sva_seqs")
+
+#gs_upload("mei_sva_clustered_seqs.fasta", "scratch/alex/sva_seqs")
+
+```
+
+```{r write-sva-regions-bed}
+sva_bed_df %>%
+  group_by(cluster_id) %>%
+  summarize(chrom = unique(chrom), start = min(start), end=max(end)) %>%
+  select(chrom, start, end, cluster_id) %>%
+  arrange(chrom, start) %>%
+  write_delim("mei_svas.bed", col_names=FALSE, delim="\t")
+```
+
+# Classify SVA MEIs by gencode region
+## Download gencode file
+```{bash parse-gencode-gtf}
+# TODO: ~/programs/bedtools is a hardcoded path from the old machine — confirm it (and
+# ref/gencode.v48.basic.annotation.gtf.gz, ref/hg38.chrom.sizes used a couple chunks down)
+# actually exist here. Bash chunks don't stop the notebook on a missing-file error, so a
+# failure here just shows up later as missing files in "annotate-sva-positions"
+gtf="ref/gencode.v48.basic.annotation.gtf.gz"
+
+zcat ref/gencode.v48.basic.annotation.gtf.gz \
+  | awk '$3=="gene" {
+      id=$0;   sub(/.*gene_id "/,   "", id);   sub(/".*/, "", id)
+      name=$0; sub(/.*gene_name "/, "", name); sub(/".*/, "", name)
+      type=$0; sub(/.*gene_type "/, "", type); sub(/".*/, "", type)
+      print id, name, type
+    }' OFS="\t" > ref/gene_info.tsv
+    
+# genes
+zcat $gtf | awk '$3=="gene"' > ref/genes.gtf
+
+# exons
+zcat $gtf | awk '$3=="CDS" || $3=="UTR" || $3=="start_codon" || $3=="stop_codon"' > ref/exon_features.gtf
+
+zcat $gtf | awk '$3=="exon"' > ref/exons.gtf
+
+# introns = gene bodies minus exons
+bedtools subtract \
+  -a ref/genes.gtf \
+  -b ref/exons.gtf \
+  > ref/introns.gtf
+  
+zcat $gtf | awk 'BEGIN{OFS="\t"} $3=="gene" {
+  id=$0; sub(/.*gene_id "/, "", id); sub(/".*/, "", id)
+  print $1, $4-1, $5, id, ".", $7
+}' > ref/genes.bed
+
+#zcat $gtf | awk 'BEGIN{OFS="\t"} $3=="gene" {
+#  print $1, $4-1, $5, ".", ".", $7
+#}'  > ref/genes.bed
+
+# genome sizes required
+# e.g. hg38.chrom.sizes
+
+```
+
+```{bash make-flanking-regions}
+# 10kb upstream, strand-aware
+bedtools flank -s -l 10000 -r 0 \
+  -i ref/genes.bed \
+  -g ref/hg38.chrom.sizes \
+  > ref/upstream_10kb.bed
+
+# 10kb downstream, strand-aware
+bedtools flank -s -l 0 -r 10000 \
+  -i ref/genes.bed \
+  -g ref/hg38.chrom.sizes \
+  > ref/downstream_10kb.bed
+```
+
+## Now do the intersections
+```{bash build-ref-sva-bed}
+# TODO: SVA_regions_van_bree_flanked.txt doesn't exist in the cwd on this VM — needs to be
+# copied over (or this path fixed) before this runs
+cut -f 1,5 SVA_regions_van_bree_flanked.txt | tr ":" "\t" | tr "-" "\t" | sort -k1,1 -k2,2n > ref_svas.bed
+```
+
+```{bash intersect-genic-regions}
+# GTF intersections: extract gene_id from attribute string
+extract_gene_gtf='BEGIN{OFS="\t"} {
+  id=$0; sub(/.*gene_id "/, "", id); sub(/".*/, "", id)
+  print $1,$2,$3,$4,id
+}'
+extract_gene_gtf_wfeature='BEGIN{OFS="\t"} {
+  id=$0; sub(/.*gene_id "/, "", id); sub(/".*/, "", id)
+  print $1,$2,$3,$4,id,$7
+}' 
+
+# BED intersections: gene_id is col4 of upstream/downstream BED → col7 after -wa -wb
+extract_gene_bed='BEGIN{OFS="\t"} {print $1,$2,$3,$4,$8}'
+
+bedtools intersect -wa -wb -a mei_svas.bed -b ref/exon_features.gtf   | awk "$extract_gene_gtf_wfeature" > intersect/mei_sva.exonic_feature.bed
+bedtools intersect -wa -wb -a mei_svas.bed -b ref/exons.gtf           | awk "$extract_gene_gtf" > intersect/mei_sva.exonic.bed
+bedtools intersect -wa -wb -a mei_svas.bed -b ref/introns.gtf         | awk "$extract_gene_gtf" > intersect/mei_sva.intronic.bed
+bedtools intersect -wa -wb -a mei_svas.bed -b ref/upstream_10kb.bed   | awk "$extract_gene_bed" > intersect/mei_sva.upstream.bed
+bedtools intersect -wa -wb -a mei_svas.bed -b ref/downstream_10kb.bed | awk "$extract_gene_bed" > intersect/mei_sva.downstream.bed
+
+bedtools intersect -wa -wb -a ref_svas.bed -b ref/exon_features.gtf   | awk "$extract_gene_gtf_wfeature" > intersect/ref_sva.exonic_feature.bed
+bedtools intersect -wa -wb -a ref_svas.bed -b ref/exons.gtf           | awk "$extract_gene_gtf" > intersect/ref_sva.exonic.bed
+bedtools intersect -wa -wb -a ref_svas.bed -b ref/introns.gtf         | awk "$extract_gene_gtf" > intersect/ref_sva.intronic.bed
+bedtools intersect -wa -wb -a ref_svas.bed -b ref/upstream_10kb.bed   | awk "$extract_gene_bed" > intersect/ref_sva.upstream.bed
+bedtools intersect -wa -wb -a ref_svas.bed -b ref/downstream_10kb.bed | awk "$extract_gene_bed" > intersect/ref_sva.downstream.bed
+
+```
+
+## Generate the full annotation
+```{r annotate-sva-positions}
+gene_metadata <- read_delim("ref/gene_info.tsv", col_names = c("gene_id", "gene_name", "gene_type"))
+
+col_names_int <- c("chrom", "start", "end", "cluster_id", "gene_id")
+annot_levels <- c("CDS", "UTR", "exon", "intron", "upstream", "downstream", "intergenic")
+
+# First for MEIs
+mei_sva_exonic_feature <- read_delim("intersect/mei_sva.exonic_feature.bed", col_names = c(col_names_int, "annot"))
+mei_sva_exonic <- read_delim("intersect/mei_sva.exonic.bed", col_names = col_names_int)
+mei_sva_intronic <- read_delim("intersect/mei_sva.intronic.bed", col_names = col_names_int)
+mei_sva_upstream <- read_delim("intersect/mei_sva.upstream.bed", col_names = col_names_int)
+mei_sva_downstream <- read_delim("intersect/mei_sva.downstream.bed", col_names = col_names_int) 
+
+mei_sva_pos_bygene <- bind_rows(
+  mei_sva_exonic_feature,
+  mei_sva_exonic %>% mutate(annot = "exon"),
+  mei_sva_intronic %>% mutate(annot = "intron"),
+  mei_sva_upstream %>% mutate(annot = "upstream"),
+  mei_sva_downstream %>% mutate(annot = "downstream")
+) %>%
+  select(cluster_id, gene_id, annot) %>%
+  mutate(annot = factor(annot, levels=annot_levels, ordered=TRUE)) %>%
+  group_by(cluster_id, gene_id) %>%
+  summarize(annot = min(annot)) %>%
+  mutate(sva_id = paste0("SVA_MEI_cl", sprintf("%05d", cluster_id)))  %>%
+  left_join(gene_metadata)
+
+mei_sva_pos_overall <- sva_bed_df %>% select(cluster_id) %>% distinct() %>% left_join(mei_sva_pos_bygene %>%
+  group_by(cluster_id) %>% 
+  filter(annot == min(annot))
+) %>%
+  mutate(annot = replace_na(annot, "intergenic")) %>%
+  mutate(sva_id = paste0("SVA_MEI_cl", sprintf("%05d", cluster_id))) 
+
+mei_sva_pos_overall_pc <- sva_bed_df %>% select(cluster_id) %>% distinct() %>% left_join(mei_sva_pos_bygene %>%
+  filter(gene_type == "protein_coding") %>%
+  group_by(cluster_id) %>% 
+  filter(annot == min(annot))
+) %>%
+  mutate(annot = replace_na(annot, "intergenic")) %>%
+  mutate(sva_id = paste0("SVA_MEI_cl", sprintf("%05d", cluster_id))) 
+
+# Now for REFs
+ref_sva_exonic_feature <- read_delim("intersect/ref_sva.exonic_feature.bed", col_names = c(col_names_int, "annot"))
+ref_sva_exonic <- read_delim("intersect/ref_sva.exonic.bed", col_names = col_names_int)
+ref_sva_intronic <- read_delim("intersect/ref_sva.intronic.bed", col_names = col_names_int)
+ref_sva_upstream <- read_delim("intersect/ref_sva.upstream.bed", col_names = col_names_int)
+ref_sva_downstream <- read_delim("intersect/ref_sva.downstream.bed", col_names = col_names_int) 
+
+ref_sva_pos_bygene <- bind_rows(
+  ref_sva_exonic_feature,
+  ref_sva_exonic %>% mutate(annot = "exon"),
+  ref_sva_intronic %>% mutate(annot = "intron"),
+  ref_sva_upstream %>% mutate(annot = "upstream"),
+  ref_sva_downstream %>% mutate(annot = "downstream")
+) %>%
+  select(sva_id, gene_id, annot) %>%
+  mutate(annot = factor(annot, levels=annot_levels, ordered=TRUE)) %>%
+  group_by(sva_id, gene_id) %>%
+  summarize(annot = min(annot)) %>%
+  left_join(gene_metadata)
+
+# TODO: ref_subfamily is used here but isn't defined until the "mei-subfamily-by-element"
+# chunk further down — this chunk currently depends on something defined later in the doc
+ref_sva_pos_overall <- ref_subfamily %>% select(sva_id) %>% distinct() %>% left_join(ref_sva_pos_bygene %>%
+  group_by(sva_id) %>% 
+  filter(annot == min(annot))
+) %>%
+  mutate(annot = replace_na(annot, "intergenic"))
+
+ref_sva_pos_overall_pc <- ref_subfamily %>% select(sva_id) %>% distinct() %>% left_join(ref_sva_pos_bygene %>%
+  filter(gene_type == "protein_coding") %>%
+  group_by(sva_id) %>% 
+  filter(annot == min(annot))
+) %>%
+  mutate(annot = replace_na(annot, "intergenic"))
+```
+
+```{r placeholder}
+```
+
+# Now come back here after genotyping is done
+
+
+## First the overall counts of meis by individual
+```{r mei-ref-counts-per-indiv}
+
+mei_length_tidy <- gs_download("gs://fc-secure-562de450-90d6-4956-9ac3-7d28c681a45d/submissions/14807ece-5021-458a-a5f4-1ab1d7be603f/ProcessMEISVAData/68893a11-d287-4253-a534-4440ddc778cf/call-ProcessMEISVADataTask/SVA_MEI_lengths_tidy.txt.gz") %>%
+  read_delim(delim="\t")
+  
+
+# From sva_mei_genotype_prep.Rmd
+mei_indiv_count <- mei_length_tidy %>%
+  group_by(indiv) %>%
+  tally()
+
+mei_indiv_count %>%
+  ggplot(aes(x=n)) +
+    geom_histogram(fill="black") + 
+    scale_y_continuous(expand=expansion(mult=c(0, 0.1))) +
+    coord_cartesian(xlim=c(0, 150)) +
+    labs(y = "Count", x ="# of SVA MEIs\nDetected per Individual") +
+    theme_clean()
+ggsave("figures/mei_count_by_indiv.pdf", width=3, height=3)
+
+ref_length_tidy <- gs_download("gs://fc-secure-562de450-90d6-4956-9ac3-7d28c681a45d/submissions/3346a6a4-d765-4e60-b787-f455f654c33f/ProcessRefSVAData/ccff4f75-4917-45ef-9e74-c421380b6ac1/call-ProcessRefSVADataTask/ref_SVA_length_filtered.txt.gz") %>%
+  read_delim(delim="\t") %>%
+  filter(!(sva_id %in% mei_length_tidy$sva_id)) # Filter out the MEIs
+
+ref_indiv_count <- ref_length_tidy %>%
+  filter(!is.na(length_VNTR)) %>%
+  group_by(indiv) %>%
+  tally()
+
+ref_indiv_count %>%
+  ggplot(aes(x=n)) +
+    geom_histogram(fill="black") + 
+    geom_vline(xintercept = 2154 * 2, linetype="dotted", color="red") +
+    scale_y_continuous(expand=expansion(mult=c(0, 0.1))) +
+    coord_cartesian(xlim=c(0, 4400)) +
+    labs(y = "Count", x ="# of Reference\nSVAs Identified per Individual") +
+    theme_clean()
+ggsave("figures/ref_count_by_indiv.pdf", width=3, height=3)
+```
+
+## Now look at variability
+
+### First by subfamily
+```{r mei-subfamily-by-element}
+mei_subfamily_groups <- sva_bed_df %>%
+  group_by(chrom, cluster_id, MEI_subfamily) %>%
+  tally() 
+
+ambig_subfamily <- mei_subfamily_groups %>%
+  group_by(cluster_id) %>%
+  mutate(frac = n / sum(n)) %>%
+  filter(max(frac) <= 0.5) %>%
+  pull(cluster_id) %>%
+  unique()
+  
+mei_subfamily <- mei_subfamily_groups %>%
+  filter(!(cluster_id %in% ambig_subfamily)) %>%
+  group_by(cluster_id) %>%
+  filter(n == max(n)) %>%
+  ungroup() %>%
+  mutate(sva_id = paste0("SVA_MEI_cl", sprintf("%05d", cluster_id))) %>%
+  select(sva_id, subfamily=MEI_subfamily)
+
+ref_subfamily <- read_delim("SVA_regions_van_bree_flanked.txt", col_names=c("region", "subfamily", "strand", "score", "SVA_id")) %>%
+  select(sva_id=SVA_id, subfamily)
+
+  
+set.seed(100)
+mei_length_tidy %>%
+  left_join(mei_subfamily) %>%
+  filter(!is.na(subfamily)) %>%
+  ggplot(aes(x=length_hexamer, y=subfamily)) +
+  geom_boxplot(color="black", scale="width", outlier.size=0.5, outlier.color="grey", outlier.alpha=0.5) +
+  #geom_jitter(alpha=0.5, color='grey') + 
+  scale_y_discrete(limits=rev) +
+  labs(x = "Hexamer Length") +
+  theme_clean(base_size=20) +
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_blank()
+  )
+ggsave("figures/MEI_hex_length_by_subfamily.pdf", width=5, height=3)
+```
+
+```{r mei-vntr-length-by-subfamily}
+
+mei_length_tidy %>%
+  left_join(mei_subfamily) %>%
+  filter(!is.na(subfamily)) %>%
+  ggplot(aes(x=length_VNTR, y=subfamily)) +
+    geom_boxplot(color="black", scale="width", outlier.size=0.5, outlier.color="grey", outlier.alpha=0.5) +
+    #geom_jitter(alpha=0.5, color='grey') + 
+    scale_y_discrete(limits=rev) +
+    labs(x = "Hexamer Length") +
+    theme_clean(base_size=20) +
+    theme(
+      legend.position = "none",
+      panel.grid.major.y = element_blank()
+    )
+ggsave("figures/MEI_VNTR_length_by_subfamily.pdf", width=5, height=3)
+```
+```{r ref-length-by-subfamily}
+
+p <- ref_length_tidy %>%
+  left_join(ref_subfamily) %>%
+  filter(!is.na(subfamily)) %>%
+  ggplot(aes(x=length_hexamer, y=subfamily)) +
+  geom_boxplot(color="black", scale="width", outlier.size=0.5, outlier.color="grey", outlier.alpha=0.5) +
+  scale_y_discrete(limits=rev) +
+  labs(x = "Hexamer Length") +
+  theme_clean(base_size=20) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    legend.position = "none"
+  )
+ggsave("figures/REF_hex_length_by_subfamily.pdf", p, width=5, height=3)
+
+# TODO: all_length_df is never defined — probably meant to be ref_length_tidy
+p <- ref_length_tidy %>%
+  left_join(ref_subfamily) %>%
+  filter(!is.na(subfamily)) %>%
+  ggplot(aes(x=length_VNTR, y=subfamily)) +
+    geom_boxplot(color="black", scale="width", outlier.size=0.5, outlier.color="grey", outlier.alpha=0.5) +
+    #geom_jitter(alpha=0.5, color='grey') + 
+    scale_y_discrete(limits=rev) +
+    labs(x = "Hexamer Length") +
+    theme_clean(base_size=20) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      legend.position = "none"
+    )
+ggsave("figures/REF_VNTR_length_by_subfamily.pdf", p, width=5, height=3)
+
+```
+
+### Now within individual elements
+```{r element-level-variability}
+mei_element_sds <- mei_length_tidy %>%
+  group_by(sva_id) %>%
+  filter(n() > 0.001 * 2 * 10000) %>%
+  summarize(hexamer_sd = sd(length_hexamer, na.rm=TRUE), vntr_sd = sd(length_VNTR, na.rm=TRUE))
+
+mei_mean_hex_variable <- mean(mei_element_sds$hexamer_sd >= 6)
+mei_mean_vntr_variable <- mean(mei_element_sds$vntr_sd >= 18)
+
+ref_element_sds <- ref_length_tidy %>%
+  group_by(sva_id) %>%
+  summarize(hexamer_sd = sd(length_hexamer, na.rm=TRUE), vntr_sd = sd(length_VNTR, na.rm=TRUE))
+
+ref_mean_hex_variable <- mean(ref_element_sds$hexamer_sd >= 6)
+ref_mean_vntr_variable <- mean(ref_element_sds$vntr_sd >= 18)
+
+mei_element_sds %>%
+  ggplot(aes(x = hexamer_sd, y = vntr_sd)) +
+    geom_point() +
+    labs(x="SD(Hexamer Length)", y="SD(VNTR Length)") +
+    theme_clean(base_size=20)
+ggsave("figures/MEI_VNTRvsHex_variability.pdf", width=3, height=3)
+
+ref_element_sds %>%
+  ggplot(aes(x = hexamer_sd, y = vntr_sd)) +
+    geom_point() +
+    labs(x="SD(Hexamer Length)", y="SD(VNTR Length)") +
+    theme_clean(base_size=20)
+ggsave("figures/REF_VNTRvsHex_variability.pdf", width=3, height=3)
+
+```
+
+#### Variability by annotation
+
+##### Ref
+```{r mei-variability-by-annotation, fig.height=2, fig.width=6}
+
+ mei_element_sds %>%
+  inner_join(mei_sva_pos_overall_pc) %>%
+  mutate(is_hex_variable = hexamer_sd > 12) %>%
+  ggplot(aes(fill=annot)) +
+    geom_bar(aes(y=is_hex_variable), position="fill") +
+    theme_clean()
+
+mei_element_sds %>%
+ left_join(mei_sva_pos_overall_pc) %>%
+ mutate(is_hex_variable = hexamer_sd > 12) %>%
+ select(is_hex_variable, annot) %>%
+  table() %>%
+  chisq.test()
+
+
+mei_element_sds %>%
+  left_join(mei_sva_pos_overall_pc) %>%
+  mutate(is_vntr_variable = vntr_sd > 20) %>%
+  ggplot(aes(fill=annot)) +
+    geom_bar(aes(y=is_vntr_variable), position="fill") +
+    theme_clean()
+
+mei_element_sds %>%
+ left_join(mei_sva_pos_overall_pc) %>%
+ mutate(is_hex_variable = hexamer_sd > 6) %>%
+ select(is_hex_variable, annot) %>%
+  filter(!(annot %in% c("CDS", "UTR", "exon"))) %>%
+  mutate(annot = as.character(annot)) %>%
+  table() %>%
+  chisq.test()
+
+```
+
+##### Ref
+```{r ref-variability-by-annotation, fig.height=2, fig.width=6}
+ ref_element_sds %>%
+  left_join(ref_sva_pos_overall_pc) %>%
+  mutate(is_hex_variable = hexamer_sd > 6) %>%
+  ggplot(aes(fill=annot)) +
+    geom_bar(aes(y=is_hex_variable), position="fill") +
+    theme_clean()
+
+ref_element_sds %>%
+  left_join(ref_sva_pos_overall_pc) %>%
+  mutate(is_vntr_variable = vntr_sd > 20) %>%
+  ggplot(aes(fill=annot)) +
+    geom_bar(aes(y=is_vntr_variable), position="fill") +
+    theme_clean()
+```
+
+
+### Now by constraint
+```{r variability-by-constraint}
+mei_element_sds %>%
+  left_join(mei_sva_pos_bygene) %>%
+  left_join(loeuf_df) %>%
+  pull(annot) %>% 
+  table()
+
+mei_element_sds %>%
+  left_join(mei_sva_pos_bygene) %>%
+  left_join(loeuf_df) %>%
+  filter(annot == "intron") %>%
+  ggplot(aes(y = hexamer_sd, x = LOEUF_perc)) +
+    geom_point() +
+    theme_clean()
+
+mei_element_sds %>%
+  left_join(mei_sva_pos_bygene) %>%
+  left_join(loeuf_df) %>%
+  filter(LOEUF < 0.6) %>%
+  filter(hexamer_sd > 6 | vntr_sd > 20) %>%
+  filter(annot %in% c("UTR", "CDS"))
+
+mei_element_sds %>%
+  left_join(mei_sva_pos_bygene) %>%
+  left_join(loeuf_df) %>%
+  filter(LOEUF < 0.6) %>%
+  filter(hexamer_sd > 6 | vntr_sd > 20) %>%
+  filter(annot %in% c("intron"))
+  
+mei_element_sds %>%
+  left_join(mei_sva_pos_bygene) %>%
+  left_join(loeuf_df) %>%
+  filter(annot == "intron") %>%
+  ggplot(aes(y = vntr_sd, x = LOEUF_perc)) +
+    geom_point() +
+    theme_clean()
+
+ref_element_sds %>%
+  left_join(ref_sva_pos_bygene) %>%
+  left_join(loeuf_df) %>%
+  filter(annot %in% c("UTR", "CDS")) %>%
+  filter(hexamer_sd > 6 | vntr_sd > 20) %>%
+  filter(LOEUF < 0.6)
+
+ref_element_sds %>%
+  left_join(ref_sva_pos_bygene) %>%
+  left_join(loeuf_df) %>%
+  filter(annot %in% c("intron")) %>%
+  filter(hexamer_sd > 6 | vntr_sd > 20) %>%
+  filter(LOEUF < 0.6)
+
+ref_element_sds %>%
+  left_join(ref_sva_pos_bygene) %>%
+  left_join(loeuf_df) %>%
+  filter(annot == "CDS") %>%
+  ggplot(aes(y = hexamer_sd, x = LOEUF_perc)) +
+    geom_point() +
+    theme_clean()
+  
+ref_element_sds %>%
+  left_join(ref_sva_pos_bygene) %>%
+  left_join(loeuf_df) %>%
+  filter(annot == "CDS") %>%
+  ggplot(aes(y = vntr_sd, x = LOEUF_perc)) +
+    geom_point() +
+    theme_clean()
+
+```
+Check against OMIM
+```{r mei-omim-check}
+omim_df <- omim_gm %>%
+  select(gene_name=`Approved Gene Symbol`, Phenotypes, Comments) %>%
+  drop_na(gene_name)
+
+mei_element_sds %>%
+  left_join(mei_sva_pos_bygene) %>%
+  left_join(omim_df) %>% 
+  drop_na(Phenotypes) %>%
+  filter(annot %in% c("CDS", "UTR"))
+
+mei_element_sds %>%
+  left_join(mei_sva_pos_bygene) %>%
+  left_join(omim_df) %>% 
+  drop_na(Phenotypes) %>%
+  filter(annot %in% c("intron")) %>%
+  filter(hexamer_sd > 6 | vntr_sd > 20)
+```
+
+```{r ref-omim-check}
+ref_element_sds %>%
+  left_join(ref_sva_pos_bygene) %>%
+  left_join(omim_df) %>%
+  drop_na(Phenotypes) %>%
+  filter(annot %in% c("CDS", "UTR"))
+
+ref_element_sds %>%
+  left_join(ref_sva_pos_bygene) %>%
+  left_join(omim_df) %>% 
+  drop_na(Phenotypes) %>%
+  filter(annot %in% c("intron")) %>%
+  filter(hexamer_sd > 6 | vntr_sd > 20)
+```
+# Make waterfall plots
+```{r waterfall-plots}
+
+repeat_positions <- read_delim("./mei_sva_clustered_seqs.fasta_repeat_positions.txt") %>%
+  dplyr::rename(seq_name="ID") %>%
+  left_join(sva_bed_df %>% select(ID, cluster_id, MEI_subfamily, fastaheader), by=c("seq_name"="fastaheader"))
+
+graph_cluster1 <- 1328
+graph_cluster2 <- 10610
+graph_cluster3 <- 2564
+
+graph_svas <- function(df, base_size) {
+  df %>%
+    filter(!(region %in% c("hexamer_region", "VNTR_region"))) %>%
+    mutate(region = if_else(grepl("skip", region, fixed=TRUE), "skip", region)) %>%
+    group_by(ID) %>%
+    mutate(total_length = max(end)) %>%
+    mutate(mid = (start+end)/2, length = (end - start)) %>%
+    ggplot(aes(y=reorder(seq_name, -total_length))) +
+    geom_tile(aes(x=mid, fill=region, width=length), height=0.95) +
+    scale_x_continuous(expand=c(0,0)) +
+    scale_fill_manual(
+      values=c("hex"='red', "VNTR_1"="#92cbdf", "VNTR_2"="#2596be", "VNTR_3"="#134b5f", "skip"='grey')
+    ) + 
+    labs(x = 'Position', y = 'Haplotype', fill = 'Repeat type') +
+    theme_clean(base_size=base_size) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_blank()
+    )
+}
+
+for (i in 1:10) {
+  repeat_positions %>%
+    filter(cluster_id == top100_uniq_clusters[i]) %>%
+    #mutate(region = if_else(region == "hex", "skip", region)) %>%
+    graph_svas()
+}
+
+sample_frac_of_column <- function(df, column, frac=0.1) {
+  values <- df[[column]] %>% unique()
+  s_values <- sample(values, ceiling(frac * length(values)))
+  df %>%
+    filter(.data[[column]] %in% s_values)
+}
+
+set.seed(101)
+repeat_positions %>%
+  filter(cluster_id == graph_cluster1) %>%
+  sample_frac_of_column("seq_name", frac=0.1) %>%
+  mutate(region = if_else(region == "hex", "skip", region)) %>%
+  graph_svas(base_size=20) + 
+  labs(y="chr10:3041557_INS Haplotype") 
+ggsave(glue("figures/SVA_hap_examples_{graph_cluster1}.pdf"))
+
+repeat_positions %>%
+  filter(cluster_id == graph_cluster2) %>%
+  sample_frac_of_column("seq_name", frac=0.05) %>%
+  graph_svas(base_size=20) +
+  labs(y="chr6:100746160_INS Haplotype") 
+ggsave(glue("figures/SVA_hap_examples_{graph_cluster2}.pdf"))
+
+repeat_positions %>%
+  filter(cluster_id == graph_cluster3) %>%
+  group_by(seq_name) %>%
+  mutate(
+    trim = end[region == "skip1_skip"],
+    start = start - trim,
+    end = end-trim
+  ) %>%
+  ungroup() %>%
+  select(-trim) %>%
+  filter(region != "skip1_skip") %>%
+  sample_frac_of_column("seq_name", frac=0.05) %>%
+  graph_svas(base_size=20) +
+  labs(y="chr6:100746160_INS Haplotype") 
+ggsave(glue("figures/SVA_hap_examples_{graph_cluster3}.pdf"))
+```
+
+# Get example of really long SVAs
+```{r long-sva-examples}
+mei_repeat_positions <- gs_download("gs://fc-secure-562de450-90d6-4956-9ac3-7d28c681a45d/submissions/0ee02fb2-1da8-4eb4-8edc-5f36010f1885/sva_extract_workflow/1488fa0d-3cb4-495a-bad0-bc2c13851ac7/call-ConcatPositions/mei_sva_clustered_seqs.fasta_repeat_positions.txt", force=TRUE) %>%
+  read_delim() %>%
+  dplyr::rename(seq_name="ID") %>%
+  left_join(sva_bed_df %>% select(ID, cluster_id, sva_id, MEI_subfamily, fastaheader), by=c("seq_name"="fastaheader"))
+
+clusters_view <- c("SVA_MEI_cl07395", "SVA_MEI_cl03605", "SVA_MEI_cl08900")
+
+graph_df <- mei_repeat_positions %>%
+  filter(sva_id %in% clusters_view, region == "hex") %>%
+  group_by(seq_name) %>%
+  mutate(adj_start = start - min(start), adj_end = end - min(start)) %>%
+  mutate(total_length = max(adj_end)) %>%
+  mutate(mid = (adj_start+adj_end)/2, length = (end - start)) 
+
+graph_df %>%
+#  filter(sva_id == "cl08900")
+  ggplot(aes(y=reorder(seq_name, -total_length))) +
+  geom_tile(aes(x=mid, fill=seq, width=length), height=0.95) +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_color_tableau() +
+  facet_wrap(~ sva_id, scales="free", ncol=1) +
+  theme_clean() + 
+  theme(
+    legend.position = "none",
+    axis.text.y = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+```
+
+# Look at ancestry & local ancestry
+## First predicted global ancestry
+```{r ancestry-by-haplotype}
+
+ancestry_file <- gs_download("gs://prod-drc-broad/longreads/demo_group/lrWGS.phase2.sample.final_set.2025-05-27.tsv") %>% 
+  read_delim() %>%
+  select(indiv=participant, pred_ancestry) %>%
+  mutate(indiv=as.character(indiv)) %>% 
+  distinct()
+
+cluster_graph <- 7098
+sva_graph <- "SVA_MEI_chr2_cl07098"
+pos <- 193680301
+chrom <- "chr2"
+
+
+sva_graph <- "SVA_1049"
+
+sva_graph <- "SVA_MEI_chr12_cl02564"
+chrom <- "chr12"
+pos <- 4633735
+
+# TODO: gt_byhap is never created in this file — looks like it needs to come from
+# sva_genotype_prep.Rmd (or wherever genotyping happens, per the "come back here after
+# genotyping is done" note above), run earlier in the same session
+gt_byhap %>%
+#ref_length_df %>%
+  mutate(indiv = as.character(indiv)) %>%
+  filter(sva_id == sva_graph) %>%
+  left_join(ancestry_file, by="indiv") %>%
+  drop_na("pred_ancestry") %>%
+  arrange(pred_ancestry, length_hexamer) %>%
+  mutate(custom_order = 1:n()) %>%
+  ggplot(aes(x=custom_order, y=length_hexamer, fill=pred_ancestry)) +
+    geom_bar(stat="identity") +
+    scale_fill_tableau() +
+    labs(x="Haplotype") +
+    theme_minimal()
+
+gt_byhap %>%
+  filter(sva_id == sva_graph) %>%
+  left_join(ancestry_file, by="indiv") %>%
+  drop_na("pred_ancestry") %>%
+  arrange(pred_ancestry, length_VNTR) %>%
+  mutate(custom_order = 1:n()) %>%
+  ggplot(aes(x=custom_order, y=length_VNTR, fill=pred_ancestry)) +
+    geom_bar(stat="identity") +
+    scale_fill_tableau() +
+    labs(x="Haplotype") +
+    theme_minimal()
+
+```
+
+## Now local ancestry
+```{r local-ancestry}
+ancestry_lookup <- data.frame(
+  index  = 0:77,
+  pop    = c("GBR","FIN","CHS","PUR","CDX","CLM","IBS","PEL","PJL","KHV",
+             "ACB","GWD","ESN","BEB","MSL","STU","ITU","Brahui","Balochi","Hazara",
+             "Makrani","Sindhi","Pathan","Kalash","Burusho","MbutiPygmy","BiakaPygmy","Melanesian","French","Papuan",
+             "Druze","Bedouin","Sardinian","Palestinian","Colombian","Cambodian","Japanese","Han","Orcadian","Surui",
+             "Maya","Russian","Mandenka","Yoruba","Yakut","San","BantuSouthAfrica","Karitiana","Pima","Tujia",
+             "Italian","Tuscan","Yi","Miao","Oroqen","Daur","Mongola","Hezhen","Xibo","Mozabite",
+             "Uygur","Dai","Lahu","She","Naxi","Tu","Basque","Adygei","BantuKenya","CEU",
+             "YRI","CHB","JPT","LWK","ASW","MXL","TSI","GIH"),
+  source = c("1000G","1000G","1000G","1000G","1000G","1000G","1000G","1000G","1000G","1000G",
+             "1000G","1000G","1000G","1000G","1000G","1000G","1000G","HGDP","HGDP","HGDP",
+             "HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP",
+             "HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP",
+             "HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP",
+             "HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP",
+             "HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","HGDP","1000G",
+             "1000G","1000G","1000G","1000G","1000G","1000G","1000G","1000G"),
+  region = c("Europe","Europe","EastAsia","Americas","EastAsia","Americas","Europe","Americas","CentralSouthAsia","EastAsia",
+             "Africa","Africa","Africa","CentralSouthAsia","Africa","CentralSouthAsia","CentralSouthAsia","CentralSouthAsia","CentralSouthAsia","CentralSouthAsia",
+             "CentralSouthAsia","CentralSouthAsia","CentralSouthAsia","CentralSouthAsia","CentralSouthAsia","Africa","Africa","Oceania","Europe","Oceania",
+             "MiddleEast","MiddleEast","Europe","MiddleEast","Americas","EastAsia","EastAsia","EastAsia","Europe","Americas",
+             "Americas","Europe","Africa","Africa","EastAsia","Africa","Africa","Americas","Americas","EastAsia",
+             "Europe","Europe","EastAsia","EastAsia","EastAsia","EastAsia","EastAsia","EastAsia","EastAsia","MiddleEast",
+             "CentralSouthAsia","EastAsia","EastAsia","EastAsia","EastAsia","EastAsia","Europe","Europe","Africa","Europe",
+             "Africa","EastAsia","EastAsia","Africa","Africa","Americas","Europe","CentralSouthAsia"),
+  stringsAsFactors = FALSE
+)
+
+get_local_ancestry <- function(chrom, pos) {
+  range <- 100000
+  start <- pos - range
+  end <- pos + range
+  # TODO: Change this to use gs URL
+  url <- glue("~/la_vcfs/{chrom}.anc.vcf.gz")
+  command = glue("~/programs/bcftools-1.23.1/bcftools query -r {chrom}:{start}-{end} -f '[%CHROM\t%POS\t%SAMPLE\t%AN1\t%AN2\n]' {url}  > filtered_regions/{chrom}_{pos}_la.txt")
+  system(command)
+  df <- read_delim(glue("filtered_regions/{chrom}_{pos}_la.txt"), col_names=c("chrom", "pos", "indiv", "h1_la", "h2_la"), show_col_types=FALSE)
+  
+  all_pos <- df$pos %>% unique()
+  closest_pos_up <- max(all_pos[all_pos < pos])
+  closest_pos_down <- min(all_pos[all_pos > pos])
+  
+  df %>% 
+    filter(pos %in% c(closest_pos_up, closest_pos_down)) %>%
+    pivot_longer(c(h1_la, h2_la), names_to="hap", values_to="la") %>%
+    mutate(hap = sub("_la", "", hap)) %>%
+    group_by(indiv, hap) %>%
+    filter(n_distinct(la) == 1) %>%
+    select(indiv, hap, la) %>%
+    distinct() %>%
+    mutate() %>%
+    left_join(ancestry_lookup, by=c(la="index"))
+}
+
+token <- system(
+  "gcloud auth application-default print-access-token",
+  intern = TRUE
+)
+
+Sys.setenv(GCS_OAUTH_TOKEN = token)
+
+common_svas <-  mei_length_tidy %>%
+  group_by(sva_id) %>%
+  filter(n() >= 0.001 * 12680 * 2) %>%
+  pull(sva_id) %>%
+  unique()
+
+# TODO: bed_df undefined again (see earlier TODOs)
+la_preds <- lapply(common_svas, function(sva) {
+  filtered <- bed_df %>%
+    filter(sva_id == sva)
+  
+  chrom <- filtered$chrom[1]
+  pos <- median(filtered$start)
+  la <- get_local_ancestry(chrom, pos)
+  la %>%
+    mutate(sva_id=sva)
+}) %>%
+  bind_rows()
+  get_local_ancestry(chrom, pos)
+
+# TODO: this references la_pred (singular) but the object built above is la_preds —
+# probably a typo
+gt_byhap %>%
+  filter(sva_id == sva_graph) %>%
+  left_join(la_pred, by=c("indiv", "hap")) %>%
+  drop_na("pop") %>%
+  arrange(pop, length_hexamer) %>%
+  mutate(custom_order = 1:n()) %>%
+  ggplot(aes(x=custom_order, y=length_hexamer, fill=pop)) +
+    geom_bar(stat="identity") +
+    scale_fill_tableau() +
+    labs(x="Haplotype") +
+    theme_minimal()
+
+
+```
+
+## Look at ancestry specific expansions
+```{r ancestry-specific-expansions}
+
+ancestries <- ancestry_file %>%
+  drop_na(pred_ancestry) %>%
+  pull(pred_ancestry) %>%
+  unique()
+
+# TODO: left_join() here has no arguments, and there's no %>% before group_by() —
+# looks like an incomplete edit
+z <- gt_byhap %>%
+  left_join(ancestry_file, by="indiv") %>%
+  left_join()
+  group_by(sva_id) %>%
+  filter(n() >= 0.05 * 12680 * 2) %>%
+  ungroup() %>%
+  pivot_longer(cols=c(length_VNTR, length_hexamer), names_prefix="length_", names_to="repeat_type", values_to="length")
+
+overall_var <- z %>% 
+  drop_na(pred_ancestry) %>%
+  group_by(sva_id, repeat_type) %>%
+  summarize(mean = mean(length), sd = sd(length), nn_perc = quantile(length, 0.99), n=n(), .groups="drop")
+
+var_notanc <- lapply(ancestries, function(a) {
+  z %>% 
+    drop_na(pred_ancestry) %>%
+    filter(pred_ancestry != a) %>%
+    group_by(sva_id, repeat_type) %>%
+    summarize(mean = mean(length), sd = sd(length), nn_perc = quantile(length, 0.99), n=n(), .groups="drop") %>%
+    mutate(pred_ancestry = a)
+}) %>%
+  bind_rows()
+
+ancestry_var <- z %>% 
+  drop_na(pred_ancestry) %>%
+  group_by(sva_id, repeat_type, pred_ancestry) %>%
+  summarize(mean_anc = mean(length), sd_anc = sd(length),  n_anc=n(), .groups="drop") %>%
+  left_join(overall_var) %>%
+  left_join(
+    var_notanc %>%
+      select(sva_id, repeat_type, pred_ancestry, mean_notanc=mean, sd_notanc=sd, nn_perc_notanc=nn_perc, n_notanc=n)
+  )
+
+anc_z_scores <- z %>%
+  inner_join(ancestry_var %>% filter(sd > 0)) %>%
+  mutate(z_sc = ((length - mean) / sd), z_sc_notanc = ((length-mean_notanc)/sd_notanc))
+
+anc_z_scores %>%
+  filter((repeat_type == "hexamer" & mean > 20) | (repeat_type == "VNTR" & mean > 100)) %>%
+  group_by(pred_ancestry) %>%
+  tally()
+
+anc_z_scores %>%
+  filter((repeat_type == "hexamer" & mean > 20) | (repeat_type == "VNTR" & mean > 100)) %>%
+  filter(abs(z_sc) > 6) %>%
+  group_by(pred_ancestry) %>%
+  tally()
+
+anc_z_scores %>%
+  filter((repeat_type == "hexamer" & mean > 20) | (repeat_type == "VNTR" & mean > 100)) %>%
+  filter(length > nn_perc_notanc) %>%
+  group_by(pred_ancestry) %>%
+  tally()
+```
+```{r ancestry-haplotype-counts-plot}
+anc_z_scores %>%
+  ggplot(aes(x=pred_ancestry)) +
+    geom_bar(aes(fill="a"), position="stack") +
+    scale_fill_tableau() +
+    scale_y_continuous(expand = expansion(mult=c(0, 0.1))) +
+    labs(x = "Predicted Ancestry", y="Haplotype Count") +
+    theme_clean()
+```
+
+```{r ancestry-outlier-counts-plot}
+
+anc_z_scores %>%
+  filter((repeat_type == "hexamer" & mean > 20) | (repeat_type == "VNTR" & mean > 100)) %>%
+  mutate(
+    is_out = length > nn_perc,
+    is_anc_out = length > nn_perc_notanc
+  ) %>%
+  mutate(
+    categ = case_when(
+      is_anc_out & !is_out ~ "Just Ancestry",
+      is_out & !is_anc_out ~ "Just Overall",
+      is_anc_out & is_out ~ "Both",
+      .default = "Not Outlier"
+    )
+  ) %>%
+  filter(categ != "Not Outlier") %>%
+  ggplot(aes(x=pred_ancestry)) +
+    geom_bar(aes(fill=categ), position="stack") +
+    scale_fill_tableau() +
+    scale_y_continuous(expand = expansion(mult=c(0, 0.1))) +
+    labs(x = "Predicted Ancestry", y="Outlier Count") +
+    theme_clean()
+ggsave("figures/ancestry_specific_outlier_count.pdf", width=5, height=3)
+```
+
+Now for an example
+```{r example-vntr-outlier-cluster1}
+
+yy <- anc_z_scores %>%
+  filter((repeat_type == "hexamer" & mean > 20) | (repeat_type == "VNTR" & mean > 100)) %>%
+  mutate(
+    is_out = length > nn_perc,
+    is_anc_out = length > nn_perc_notanc
+  ) %>%
+  group_by(sva_id, repeat_type, pred_ancestry) %>%
+  summarize(n = n(), n_out = sum(is_out), n_anc_out = sum(is_anc_out), n_both = sum(is_out & is_anc_out), .groups="drop") %>%
+  arrange(sva_id) %>%
+  group_by(sva_id) %>%
+  filter(any(n_out > 50))
+
+cluster_graph <- "SVA_MEI_chr14_cl03872"
+rt_graph <- "VNTR"
+
+zz <- anc_z_scores %>% 
+  filter(sva_id == cluster_graph, repeat_type == rt_graph)
+
+out_thresh <- zz %>%
+  pull(nn_perc) %>%
+  unique()
+
+out_thresh_anc <- zz %>%
+  select(pred_ancestry, nn_perc_notanc) %>%
+  distinct()
+
+anc_z_scores %>%
+  filter(sva_id == cluster_graph, repeat_type == "VNTR") %>%
+  ggplot() + 
+    geom_vline(xintercept=out_thresh, color="grey") +
+    geom_vline(data=out_thresh_anc, aes(xintercept=nn_perc_notanc), color="blue", linetype="dotted") +
+    geom_histogram(aes(x=length), binwidth=10, fill="black") +
+    coord_cartesian(xlim=c(1300, 1600)) +
+    facet_grid(pred_ancestry ~ .) +
+    labs(x = glue("{cluster_graph} {rt_graph} length")) +
+    theme_clean()
+```
+```{r example-vntr-outlier-cluster2}
+cluster_graph <- "SVA_MEI_chr5_cl10000"
+rt_graph <- "VNTR"
+zz <- anc_z_scores %>% 
+  filter(sva_id == cluster_graph, repeat_type == rt_graph)
+
+out_thresh <- zz %>%
+  pull(nn_perc) %>%
+  unique()
+
+out_thresh_anc <- zz %>%
+  select(pred_ancestry, nn_perc_notanc) %>%
+  distinct()
+anc_z_scores %>%
+  filter(sva_id == cluster_graph, repeat_type == "VNTR") %>%
+  ggplot() + 
+    geom_vline(xintercept=out_thresh, color="grey") +
+    geom_vline(data=out_thresh_anc, aes(xintercept=nn_perc_notanc), color="blue", linetype="dotted") +
+    geom_histogram(aes(x=length), binwidth=10, fill="black") +
+    facet_grid(pred_ancestry ~ .) +
+    labs(x = glue("{cluster_graph} {rt_graph} length")) +
+    theme_clean()
+```
+
+
+
+
+
+
+
