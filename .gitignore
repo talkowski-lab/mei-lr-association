@@ -47,7 +47,12 @@ Thumbs.db
 *~
 
 # nbsync (holds the Terra workspace bucket name / local sync state)
-notebooks/
+# Add notebooks if they don't have gcloud uris in the body
+notebooks/*
+!notebooks/mei_sva_internal_var.Rmd
+!notebooks/utils.R
+
+
 .nbsync.secret
 .nbsync_state.json
 notebooks/.ipynb_checkpoints/
