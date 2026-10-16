@@ -5,7 +5,7 @@ FROM rocker/verse:4.4.1
 ## AnVIL and AnVILGCP are Bioconductor (not CRAN) packages -- installing them
 ## via install.packages() silently no-ops (it only warns on missing packages,
 ## it doesn't fail the build), so they must go through BiocManager instead.
-RUN R -e "install.packages(c('optparse', 'argparser', 'jsonlite', 'data.table', 'ggplot2', 'ggthemes', 'glue', 'arrow', 'stringdist', 'BiocManager'), repos = 'https://cloud.r-project.org')" \
+RUN R -e "install.packages(c('optparse', 'argparser', 'jsonlite', 'data.table', 'ggplot2', 'ggthemes', 'glue', 'arrow', 'stringdist', 'ape', 'BiocManager'), repos = 'https://cloud.r-project.org')" \
     && R -e "BiocManager::install(c('Biostrings', 'DECIPHER', 'GenomicRanges', 'AnVIL', 'AnVILGCP'), update = FALSE, ask = FALSE)"
 
 ## Build samtools/bcftools from source with --enable-libcurl so htslib's remote
@@ -27,12 +27,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ## process_ref_sva_data.R shells out to `gcloud auth application-default
 ## print-access-token` to set GCS_OAUTH_TOKEN for bcftools's gs:// reads.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        apt-transport-https ca-certificates gnupg curl bedtools \
+        apt-transport-https ca-certificates gnupg curl \
     && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
         | tee /etc/apt/sources.list.d/google-cloud-sdk.list \
     && curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
     && apt-get update && apt-get install -y --no-install-recommends google-cloud-cli \
     && rm -rf /var/lib/apt/lists/*
+
+## External tools the Rmd reports shell out to: minimap2 (transduction source
+## mapping and SINE-R location), mafft (reference-guided MSA), mmseqs2/vsearch
+## (clustering), fasttree (installs `fasttree` + multithreaded `fasttreeMP`),
+## bedtools (per-window GC via `bedtools nuc` for the enrichment report).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        minimap2 mafft mmseqs2 vsearch fasttree bedtools \
+    && rm -rf /var/lib/apt/lists/*
+
+## rocker/verse ships TinyTeX, which is minimal: pandoc's default LaTeX
+## template pulls in booktabs and friends as soon as a report contains a table,
+## and without them a PDF render fails after all the work is done.
+RUN R -e "tinytex::tlmgr_install(c('booktabs','longtable','array','multirow','colortbl','xcolor','caption','float','wrapfig','pdflscape','threeparttable','threeparttablex','ulem','makecell','environ','trimspaces','varwidth','tabu'))" \
+    && R -e "tinytex::tlmgr_update()"
 
 COPY scripts/ ./scripts/
 CMD ["bash"]
