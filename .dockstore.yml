@@ -242,3 +242,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: MEIStructuralCatalog
+    primaryDescriptorPath: /workflows/mei_structural_catalog.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
