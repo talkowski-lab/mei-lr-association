@@ -1,0 +1,9 @@
+## SAIGE (official image) plus bcftools for the TR VCF preflight in saige_phewas_tr.wdl.
+## SAIGE's R lives in a pixi env under /app; the step*.R scripts in /usr/local/bin
+## reach it through their shebang, so they run from any working directory.
+FROM wzhou88/saige:1.5.1
+RUN apt-get update -qq && \
+    apt-get -y install --no-install-recommends bcftools tabix && \
+    rm -rf /var/lib/apt/lists/*
+COPY scripts/ /scripts/
+CMD ["bash"]

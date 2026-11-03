@@ -233,3 +233,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: SAIGE_phewas_TR
+    primaryDescriptorPath: /workflows/saige_phewas_tr.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/

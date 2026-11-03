@@ -64,6 +64,22 @@ End-to-end pipeline, for one individual, from a reference-SVA bed + an MEI bed +
 - The two per-haplotype summaries are concatenated via `ConcatFiles.ConcatenateDelim` (`HasHeader = true`) into the final merged summary; the per-haplotype summaries are also exposed directly as outputs (`Hap1MethylationWindowSummary`/`Hap2MethylationWindowSummary`).
 - Docker images: `CombineAndWindowVariants`/`BedtoolsIntersect` run in the public `quay.io/biocontainers/bedtools` image (same as the sibling `AoU_mQTL_analysis` repo's binning tasks); `ConcatenateDelim` and `ProcessMethylationWindow` run in this repo's `python_general`/`r_analysis` images respectively.
 
+### 6. SAIGE_phewas_TR (`workflows/saige_phewas_tr.wdl`)
+
+SAIGE PheWAS: one null GLMM per phecode (Step 1, sparse GRM, categorical variance ratios), then a single-variant SPA test per phecode x chromosome (Step 2). `mode` picks what the VCF holds, and with it the field read, the Step 2 filter set and the missing-value imputation:
+
+| `mode` | VCF field (`vcffield` default) | filters used | `--impute_method` |
+|---|---|---|---|
+| `tr` (default) | DS = repeat length scaled to [0, 2] | `tr_minimal_af`/`tr_min_mac`/`tr_max_missing` = 0 / 0.5 / 0.5 | `mean` |
+| `variant` | GT hard calls (or DS if `vcffield = DS`) | `variant_*` = 0.0001 / 20 / 0.15 | `best_guess` |
+
+- In `tr` mode SAIGE's AF is mean(DS)/2, which is position on the length scale, not allele rarity, so the AF filter is off; `best_guess` would round a missing length to 0/1/2, hence `mean`. `--is_imputed_data` stays FALSE in both modes so `dosage_zerod_cutoff` never zeroes small dosages.
+- Step 2 outputs are named `<prefix>_step2Out_<phecode>_<chrom>_<mode>*`, so runs of both modes on one prefix do not collide.
+- `ValidateVCF` runs first and fails fast on input problems SAIGE would not report: an unknown `mode` or `tr` with GT, missing/wrong-Number header for the field, multi-allelic records, listed chromosomes absent from the VCF (Step 2 would die mid-run), and in the first `preflight_records` either dosages outside [0, 2] or GT calls with alleles other than 0/1, plus no VCF/phenotype sample overlap. Step 1 takes its report as an unused input purely for ordering.
+- Phecodes, chromosomes, covariates and categorical covariates come in as one-per-line text files read with `read_lines`, which keeps blank lines and `\r`; every task rebuilds its lists through a `clean_list` bash helper that drops both, so hand-edited or Windows-saved files work. The covariate files are optional and fall back to the PC1-16/sex/age defaults (an empty categorical file means none). The preflight fails on covariates that are not phenotype columns and categorical covariates not in the covariate list.
+- The MAC-category variance-ratio bounds are workflow-level inputs passed to both steps with no task defaults, so they cannot drift.
+- Image: `envs/Dockerfile.saige` = official `wzhou88/saige` + bcftools. The step*.R scripts reach SAIGE's pixi R env via their shebang (`pixi run --manifest-path /app/pixi.toml`).
+
 ### nbsync (`tools/nbsync`)
 
 Syncs `notebooks/` in this repo with the `notebooks/` folder in the Terra workspace bucket (the default location Terra puts notebooks in). That bucket folder also holds many other scripts/files unrelated to this repo — nbsync only ever touches files that have been explicitly **added**, so it won't pull in everything else sitting there.
@@ -95,7 +111,7 @@ womtool validate workflows/extract_variants.wdl
 
 ## CI
 
-Each env has its own workflow (`.github/workflows/docker-image.yml` for hail, `python-general-docker-image.yml` for python_general, `r-analysis-docker-image.yml` for r_analysis, `bioinformatics-docker-image.yml` for bioinformatics) that builds and pushes to Docker Hub on push/PR to `main`/`develop`, **only when `scripts/**` or that env's `Dockerfile.<env-name>` change**. Editing the WDLs alone will not trigger a rebuild. Images are named `<DOCKERHUB_USERNAME>/<repo-name>-<env-name>` and tagged `latest` + the 7-char commit SHA. Auth uses the `DOCKERHUB_USERNAME` repo **variable** and the `DOCKERHUB_TOKEN` **secret**. Because all workflows watch `scripts/**`, a script change rebuilds every image — the `<env-name>` suffix keeps their names distinct.
+Each env has its own workflow (`.github/workflows/docker-image.yml` for hail, `python-general-docker-image.yml` for python_general, `r-analysis-docker-image.yml` for r_analysis, `bioinformatics-docker-image.yml` for bioinformatics, `saige-docker-image.yml` for saige) that builds and pushes to Docker Hub on push/PR to `main`/`develop`, **only when `scripts/**` or that env's `Dockerfile.<env-name>` change**. Editing the WDLs alone will not trigger a rebuild. Images are named `<DOCKERHUB_USERNAME>/<repo-name>-<env-name>` and tagged `latest` + the 7-char commit SHA. Auth uses the `DOCKERHUB_USERNAME` repo **variable** and the `DOCKERHUB_TOKEN` **secret**. Because all workflows watch `scripts/**`, a script change rebuilds every image — the `<env-name>` suffix keeps their names distinct.
 
 ## Gotchas
 
