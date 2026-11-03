@@ -1,5 +1,7 @@
 version 1.0
 
+import "utils/concat_files.wdl" as ConcatFiles
+
 workflow SAIGE_phewas_TR {
     meta {
         description: "SAIGE PheWAS of either tandem-repeat lengths (mode tr: FORMAT/DS scaled to [0, 2]) or ordinary biallelic variants (mode variant: 0/1/2 GT, or DS); tests one phecode per run."
@@ -18,7 +20,7 @@ workflow SAIGE_phewas_TR {
         trait_type: "binary or quantitative; quantitative traits are inverse-normalized."
         mode: "tr (scaled repeat lengths as dosages, no AF filter, mean imputation) or variant (ordinary variants, standard AF/MAC filters, best-guess imputation). Selects which tr_* / variant_* filter set is used."
         vcf: "bgzipped VCF, one biallelic record per variant. mode tr: FORMAT/DS (Number=1, Float) = repeat length scaled to [0, 2], ALT can be a placeholder such as <TR>; effect sizes are per unit of scaled length. mode variant: hard-called FORMAT/GT, or FORMAT/DS dosages if vcffield = DS."
-        vcf_csi: "CSI index of vcf (bcftools index -c)."
+        vcf_csi: "Index of vcf: .csi (bcftools index -c), or .tbi, from which Step 2 builds a CSI itself since SAIGE reads only CSI. Supplying the .csi saves that indexing pass."
         vcffield: "FORMAT field SAIGE reads. Defaults to DS in mode tr and GT in mode variant."
         chromosome_list_file: "Text file, one chromosome per line, named exactly as in vcf (chr1 vs 1); each must have at least one record."
         ImageTag: "Tag of ayenkin1871/mei-lr-association-saige (latest or a 7-char commit SHA)."
@@ -172,11 +174,27 @@ workflow SAIGE_phewas_TR {
             preemptible      = preemptible
     }
 
+    scatter (f in RunStep2.outputfiles) {
+        String result_phecode = phecode
+    }
+
+    call ConcatFiles.ConcatenateDelim as JoinStep2Results {
+        input:
+            InputFiles      = RunStep2.outputfiles,
+            HasHeader       = true,
+            AddIdColumn     = true,
+            Ids             = result_phecode,
+            NewIdColumnName = "phenotype",
+            GzipOutput      = true,
+            OutputName      = output_prefix + "_step2Out_" + phecode + "_" + mode + ".tsv.gz"
+    }
+
     output {
         File        preflight_report    = ValidateVCF.report
         File        null_model_rda      = model_rda
         File        variance_ratio_txt  = variance_ratio
         Array[File] step2_outputs       = RunStep2.outputfiles
+        File        step2_results       = JoinStep2Results.ConcatenatedFile
     }
 }
 
@@ -208,7 +226,10 @@ task ValidateVCF {
         set -euo pipefail
 
         ln -s "~{vcf}" tr.vcf.gz
-        ln -s "~{vcf_csi}" tr.vcf.gz.csi
+        case "~{vcf_csi}" in
+            *.tbi) ln -s "~{vcf_csi}" tr.vcf.gz.tbi ;;
+            *) ln -s "~{vcf_csi}" tr.vcf.gz.csi ;;
+        esac
         errors=0
         fail() { echo "ERROR: $*" | tee -a preflight.txt >&2; errors=$((errors + 1)); }
         note() { echo "$*" | tee -a preflight.txt >&2; }
@@ -484,10 +505,18 @@ task RunStep2 {
         clean_list() { local x; for x in "$@"; do x="${x//$'\r'/}"; if [[ -n "${x}" ]]; then printf '%s\n' "${x}"; fi; done; }
         mapfile -t chromo_list < <(clean_list ~{sep=' ' chromo_list})
 
+        # SAIGE accepts only an index at exactly <vcfFile>.csi, and Cromwell may localize the
+        # index into a different directory from the VCF.
+        ln -s "~{vcf}" input.vcf.gz
+        case "~{vcf_csi}" in
+            *.csi) ln -s "~{vcf_csi}" input.vcf.gz.csi ;;
+            *) bcftools index -c --threads ~{cpu} input.vcf.gz ;;
+        esac
+
         for chromo in "${chromo_list[@]}"; do
             step2_SPAtests.R \
-                --vcfFile=~{vcf} \
-                --vcfFileIndex=~{vcf_csi} \
+                --vcfFile=input.vcf.gz \
+                --vcfFileIndex=input.vcf.gz.csi \
                 --vcfField=~{vcffield} \
                 --AlleleOrder=ref-first \
                 --chrom=${chromo} \
@@ -510,7 +539,8 @@ task RunStep2 {
     >>>
 
     output {
-        Array[File] outputfiles = glob("~{output_prefix}_step2Out_~{phecode}_*_~{mode}*")
+        # Ends in _<mode> so SAIGE's <file>.index progress markers are left out.
+        Array[File] outputfiles = glob("~{output_prefix}_step2Out_~{phecode}_*_~{mode}")
     }
 
     runtime {
