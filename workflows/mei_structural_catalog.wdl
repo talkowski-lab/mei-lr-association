@@ -23,6 +23,8 @@ workflow MEIStructuralCatalog {
         String Prefix = "mei"
         String ExtraArgs = ""
         String ImageTag = "latest"
+        ## gs:// folder every output is also copied into; omit to skip
+        String? OutputDir
     }
 
     call CatalogStructures {
@@ -39,6 +41,22 @@ workflow MEIStructuralCatalog {
             Prefix = Prefix,
             ExtraArgs = ExtraArgs,
             ImageTag = ImageTag
+    }
+
+    if (defined(OutputDir)) {
+        call CopyOutputs {
+            input:
+                Files = select_all([
+                    CatalogStructures.PerSequence,
+                    CatalogStructures.PerVariant,
+                    CatalogStructures.TransductionsFasta,
+                    CatalogStructures.TransductionsPaf,
+                    CatalogStructures.TransductionSources,
+                    CatalogStructures.SourceSummary
+                ]),
+                OutputDir = select_first([OutputDir]),
+                ImageTag = ImageTag
+        }
     }
 
     output {
@@ -132,5 +150,27 @@ task CatalogStructures {
         File? TransductionsPaf = "~{Prefix}.structure_transductions.paf"
         File? TransductionSources = "~{Prefix}.structure_transduction_sources.tsv"
         File? SourceSummary = "~{Prefix}.structure_source_summary.tsv"
+    }
+}
+
+task CopyOutputs {
+    input {
+        Array[File] Files
+        String OutputDir
+        String ImageTag = "latest"
+    }
+
+    command <<<
+        set -euo pipefail
+        gcloud storage cp ~{sep=" " Files} "~{sub(OutputDir, "/+$", "")}/"
+    >>>
+
+    runtime {
+        docker: "ayenkin1871/mei-lr-association-r_analysis:" + ImageTag
+        memory: "2 GB"
+        cpu: 1
+        disks: "local-disk " + (ceil(size(Files, "GB")) + 10) + " HDD"
+        preemptible: 2
+        maxRetries: 1
     }
 }
