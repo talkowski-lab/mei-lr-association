@@ -138,7 +138,10 @@ with out_f_cm as out_f:
                 result.check_returncode()
             text = result.stdout.decode()
         else:
-            with open(fp) as in_f:
+            with open(fp, "rb") as probe:
+                is_gzip = probe.read(2) == b"\x1f\x8b"
+            opener = gzip.open if is_gzip else open
+            with opener(fp, "rt") as in_f:
                 text = in_f.read()
 
         rows = list(csv.reader(io.StringIO(text), delimiter=delim))

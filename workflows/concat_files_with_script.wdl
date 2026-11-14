@@ -25,7 +25,9 @@ import "utils/concat_files.wdl" as ConcatFiles
 ## other File input) and EmbeddedScriptPath (a path already baked into the
 ## Docker image, e.g. "/scripts/foo.py") are mutually exclusive; if both are
 ## set, RemoteScript wins and EmbeddedScriptPath is ignored. If neither is
-## set, each file's raw contents are used as-is. Whichever script runs is
+## set, each file's raw contents are used as-is (gzipped inputs, including
+## bgzip, are detected by magic bytes and decompressed; a script receives the
+## file path untouched and must handle compression itself). Whichever script runs is
 ## invoked once per file as `<script> <file>` and must write the transformed
 ## file's contents to stdout.
 ##
