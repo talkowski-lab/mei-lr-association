@@ -779,13 +779,29 @@ src[, mapping := fifelse(is.na(src_chrom), fifelse(maps_to_insertion_site, "self
 
 ## Source element: 3' transduction -> element ends just UPSTREAM of the
 ## segment (in the segment's genomic orientation); 5' -> starts just DOWNSTREAM.
+##
+## Candidates are the reference RepeatMasker elements (FIXED sources), any
+## known_sources BEDs, and every cohort insertion (POLYMORPHIC sources). A
+## polymorphic source is absent from the reference, but the flank it transduces
+## is ordinary reference sequence beside its insertion point, so the segment
+## maps there with no reference element present; the cohort insertion is
+## entered as a zero-width element at that point, in its own orientation.
+var_strand <- per_seq[strand %in% c("+", "-"), .N, by = .(variant_id, strand)][order(variant_id, -N)][
+  , .SD[1], by = variant_id][, .(variant_id, strand)]
+cohort_E <- per_var[!is.na(chrom) & !is.na(pos), .(chrom, start = as.integer(pos), end = as.integer(pos),
+                                                   name = variant_id, rclass = as.character(family), set = "cohort")]
+cohort_E <- merge(cohort_E, var_strand[, .(name = variant_id, strand)], by = "name")
 E <- rbindlist(c(
   if (!is.null(p_str(params$ref_rmsk))) list(read_elements(params$ref_rmsk, "reference")),
-  lapply(Filter(nzchar, stri_split_fixed(params$known_sources, ",")[[1]]), function(b) read_elements(b, basename(b)))
+  lapply(Filter(nzchar, stri_split_fixed(params$known_sources, ",")[[1]]), function(b) read_elements(b, basename(b))),
+  list(cohort_E)
 ), fill = TRUE)
+LOG("source candidates: %d reference, %d known_sources, %d cohort (polymorphic) insertion sites",
+    E[set == "reference", .N], E[!set %in% c("reference", "cohort"), .N], E[set == "cohort", .N])
 src[, `:=`(source_element = NA_character_, source_class = NA_character_, source_set = NA_character_,
            source_chrom = NA_character_, source_start = NA_integer_, source_end = NA_integer_,
-           source_strand = NA_character_, source_distance = NA_integer_, source_full_length = NA)]
+           source_strand = NA_character_, source_distance = NA_integer_, source_full_length = NA,
+           source_af = NA_real_)]
 win <- p_int(params$source_window); tol <- p_int(params$overlap_tolerance)
 FAM_RE <- c(Alu = "^SINE/Alu|(^|/)Alu", L1 = "^LINE/L1|(^|/)L1", SVA = "(^|/)SVA")
 if (nrow(E) && any(!is.na(src$src_chrom))) {
@@ -797,19 +813,28 @@ if (nrow(E) && any(!is.na(src$src_chrom))) {
   Eend <- E[, .(chrom, pos = end, el_start = start, el_end = end, el_strand = strand, el_name = name, el_class = rclass, set)]
   Est <- E[, .(chrom, pos = start, el_start = start, el_end = end, el_strand = strand, el_name = name, el_class = rclass, set)]
   j1 <- Eend[m[upstream == TRUE], on = .(chrom == src_chrom, pos >= lo, pos <= hi), nomatch = 0, allow.cartesian = TRUE,
-             .(transduction, family, need, src_start, el_start, el_end, el_strand, el_name, el_class, set, dist = src_start - el_end)]
+             .(transduction, variant_id, family, need, src_start, el_start, el_end, el_strand, el_name, el_class, set,
+               dist = src_start - el_end)]
   j2 <- Est[m[upstream == FALSE], on = .(chrom == src_chrom, pos >= lo, pos <= hi), nomatch = 0, allow.cartesian = TRUE,
-            .(transduction, family, need, src_start, el_start, el_end, el_strand, el_name, el_class, set, dist = el_start - src_end)]
+            .(transduction, variant_id, family, need, src_start, el_start, el_end, el_strand, el_name, el_class, set,
+              dist = el_start - src_end)]
   j <- rbind(j1, j2)
   j <- j[el_strand %in% c(need, ".") & dist >= -tol & dist <= win]
-  j <- j[set != "reference" | stri_detect_regex(paste0(el_class, "/", el_name), FAM_RE[family])]
+  j <- j[!set %in% c("reference", "cohort") | stri_detect_regex(paste0(el_class, "/", el_name), FAM_RE[family])]
+  j <- j[!(set == "cohort" & el_name == variant_id)]
   j <- j[order(transduction, abs(dist), -(el_end - el_start))][, .SD[1], by = transduction]
   src[j, on = "transduction", `:=`(source_element = i.el_name, source_class = i.el_class, source_set = i.set,
                                    source_start = i.el_start, source_end = i.el_end, source_strand = i.el_strand,
                                    source_distance = i.dist)]
   src[!is.na(source_element), source_chrom := src_chrom]
-  src[family == "L1" & !is.na(source_element), source_full_length := (source_end - source_start) >= p_int(params$full_length_l1_bp)]
+  src[family == "L1" & (source_set == "reference") %in% TRUE,
+      source_full_length := (source_end - source_start) >= p_int(params$full_length_l1_bp)]
+  pv <- per_var[, .(variant_id, full_length, af)]
+  src[source_set == "cohort", `:=`(source_full_length = pv$full_length[match(source_element, pv$variant_id)],
+                                   source_af = pv$af[match(source_element, pv$variant_id)])]
 }
+src[, source_type := fifelse(is.na(source_set), NA_character_,
+                     fifelse(source_set == "reference", "fixed", "polymorphic"))]
 if (!is.null(p_str(params$genes)) && any(!is.na(src$src_chrom))) {
   G <- read_elements(params$genes, "gene")
   g <- G[src[!is.na(src_chrom)], on = .(chrom == src_chrom, start <= src_end, end >= src_start), nomatch = 0,
@@ -855,13 +880,57 @@ if (nrow(un) > 1 && p_bool(params$run_ava) && !is.null(which_tool("minimap2"))) 
     }
   }
 }
+## Segments with no reference locus (unmapped / self-only, including the
+## non-reference clusters): is the sequence carried by some OTHER cohort
+## insertion allele? Members of the segment's own non-reference cluster are
+## excluded, since they share it by construction.
+src[, other_alleles := NA_character_]
+un <- src[mapping %in% c("unmapped", "self_only")]
+if (nrow(un) && !is.null(which_tool("minimap2"))) {
+  afa <- file.path(tempdir(), "cohort_alleles.fa")
+  write_fasta(paste(ins$variant_id, ins$id, sep = "|"), ins$seq, afa)
+  qfa <- file.path(tempdir(), "unplaced_segments.fa")
+  write_fasta(un$transduction, tseqs[un$transduction, on = "id", seq], qfa)
+  apaf <- file.path(tempdir(), "unplaced_vs_alleles.paf")
+  run_tool(which_tool("minimap2"), c("-c", "-x", params$minimap2_preset, "--secondary=yes", "-N", "50", "-t", threads,
+                                     afa, qfa), stdout = apaf)
+  B <- read_paf(apaf)
+  if (nrow(B)) {
+    B <- B[alen > 0 & matches / alen >= p_num(params$min_identity) & (qend - qstart) / qlen >= p_num(params$min_qcov)]
+    B[, hit_variant := sub("\\|[^|]*$", "", tname)]
+    B <- merge(B, src[, .(qname = transduction, variant_id, source_locus)], by = "qname")
+    mates <- src[stri_startswith_fixed(source_locus, "nonref_cluster") %in% TRUE, paste(source_locus, variant_id)]
+    B <- B[hit_variant != variant_id & !paste(source_locus, hit_variant) %in% mates]
+    if (nrow(B)) {
+      oa <- B[, .(other_alleles = paste(sort(unique(hit_variant)), collapse = ",")), by = qname]
+      src[oa, on = .(transduction = qname), other_alleles := i.other_alleles]
+    }
+  }
+}
+
 src[, outcome := mapping]
-src[!is.na(source_element), outcome := "assigned_element"]
+src[source_type == "fixed", outcome := "assigned_fixed"]
+src[source_type == "polymorphic", outcome := "assigned_polymorphic"]
 src[stri_startswith_fixed(source_locus, "nonref_cluster") %in% TRUE, outcome := "shared_unmapped"]
 save_tab(src, "transduction_sources")
 
-srcsum <- src[!is.na(source_locus), .(n_offspring = uniqueN(variant_id), kinds = paste(sort(unique(kind)), collapse = ","),
+split_csv <- function(x) unique(unlist(strsplit(x[!is.na(x)], ",", fixed = TRUE)))
+srcsum <- src[!is.na(source_locus), .(
+  n_offspring = uniqueN(variant_id), kinds = paste(sort(unique(kind)), collapse = ","),
   families = paste(sort(unique(family)), collapse = ","), source_element = source_element[1],
-  median_td_len = as.numeric(median(td_len)), offspring_chroms = paste(sort(unique(ins_chrom)), collapse = ",")),
+  source_type = source_type[1], source_af = source_af[1], source_full_length = source_full_length[1],
+  median_td_len = as.numeric(median(td_len)), offspring_chroms = paste(sort(unique(ins_chrom)), collapse = ","),
+  offspring_span_bp = if (uniqueN(ins_chrom) == 1) as.numeric(diff(range(ins_pos))) else NA_real_,
+  other_alleles = paste(sort(split_csv(other_alleles)), collapse = ",")),
   by = source_locus][order(-n_offspring)]
+srcsum[other_alleles == "", other_alleles := NA_character_]
+## A non-reference cluster whose offspring all sit at one site is more likely a
+## single polymorphic site split across variant ids than a shared source.
+srcsum[, same_site := fifelse(stri_startswith_fixed(source_locus, "nonref_cluster"),
+                              !is.na(offspring_span_bp) & offspring_span_bp <= cw, NA)]
 save_tab(srcsum, "source_summary")
+nrc <- srcsum[stri_startswith_fixed(source_locus, "nonref_cluster")]
+LOG("sources: %d fixed, %d polymorphic, %d mapped loci without an element; %d non-reference clusters (%d at a single site, %d found in other cohort alleles)",
+    srcsum[source_type == "fixed", .N], srcsum[source_type == "polymorphic", .N],
+    srcsum[is.na(source_type) & !stri_startswith_fixed(source_locus, "nonref_cluster"), .N],
+    nrow(nrc), nrc[same_site == TRUE, .N], nrc[!is.na(other_alleles), .N])
