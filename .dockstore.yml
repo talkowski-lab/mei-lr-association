@@ -260,3 +260,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: SVAgeARG
+    primaryDescriptorPath: /workflows/sv_age_arg.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
