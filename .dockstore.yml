@@ -251,3 +251,12 @@ workflows:
         - main
       tags:
         - /.*/
+
+  - subclass: WDL
+    name: ListTerraTables
+    primaryDescriptorPath: /workflows/list_terra_tables.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/

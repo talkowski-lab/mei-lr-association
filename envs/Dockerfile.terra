@@ -1,0 +1,9 @@
+## Environment for working with Terra workspaces (data tables, buckets) via terra-notebook-utils.
+FROM python:3.11-slim
+# bgzip (a terra-notebook-utils dependency) has no wheel and compiles C with OpenMP + zlib.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir terra-notebook-utils
+COPY scripts/ ./scripts/
+CMD ["bash"]
