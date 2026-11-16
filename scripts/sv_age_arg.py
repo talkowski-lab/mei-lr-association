@@ -57,6 +57,9 @@ def parse_args(argv=None):
                      help="Ancestral-allele FASTA (e.g. Ensembl homo_sapiens_ancestor; "
                           "plain or bgzipped, whole-genome or one chromosome).")
     anc.add_argument("--ancestral-fasta-index")
+    anc.add_argument("--ancestral-offset", type=int,
+                     help="The FASTA holds one region, not whole chromosomes: its first "
+                          "base is at this 1-based position on --chrom.")
     anc.add_argument("--ancestral-info-field",
                      help="INFO field holding the ancestral allele, used if no FASTA.")
     anc.add_argument("--ancestral-high-confidence-only", action="store_true",
@@ -151,9 +154,14 @@ class Ancestral:
         self.high_conf_only = args.ancestral_high_confidence_only
         if args.ancestral_fasta:
             fa = open_fasta(args.ancestral_fasta, args.ancestral_fasta_index)
-            contig = find_contig(fa, args.chrom)
-            self.offset = start
-            self.seq = fa.fetch(contig, start - 1, end)
+            if args.ancestral_offset:
+                contig = fa.references[0]
+                self.offset = args.ancestral_offset
+                self.seq = fa.fetch(contig)
+            else:
+                contig = find_contig(fa, args.chrom)
+                self.offset = start
+                self.seq = fa.fetch(contig, start - 1, end)
             self.source = f"fasta:{os.path.basename(args.ancestral_fasta)}:{contig}"
         elif args.ancestral_info_field:
             self.field = args.ancestral_info_field
@@ -487,7 +495,6 @@ def sv_haplotypes(args, samples, ploidy):
     hap_start = np.concatenate([[0], np.cumsum(ploidy)[:-1]])
     carrier = np.zeros((n, 2), dtype=bool)
     called = np.zeros((n, 2), dtype=bool)
-    any_missing = np.zeros((n, 2), dtype=bool)
     unphased = np.zeros(n, dtype=bool)
     entry_rows = []
     for source, entries in (("phased", ph), ("full", fu)):
@@ -496,21 +503,30 @@ def sv_haplotypes(args, samples, ploidy):
             ok = rows >= 0
             r = rows[ok]
             g, phased = g[ok], phased[ok]
+            if source == "full":
+                # the full callset's phase (e.g. per-sample read-backed) does not share the
+                # phased VCF's haplotype labels, so its "|" is ignored
+                phased = np.zeros_like(phased)
             car = g > 0
-            carrier[r] |= car
             called[r] |= g >= 0
-            any_missing[r] |= g == -1
             het = car.any(1) & ~car.all(1) & (g >= 0).all(1)
             unph = het & ~phased & ~(ploidy[r] == 1)
-            unphased[r[unph]] = True
+            # an unphased het never picks a haplotype itself: an existing (phased) carrier
+            # keeps its placement, otherwise it starts on haplotype 0 and the tree decides
+            known = carrier[r].any(1)
+            car[unph] = False
+            car[unph & ~known, 0] = True
+            carrier[r] |= car
+            unphased[r[unph & ~known]] = True
             entry_rows.append({"entry": w, "source": source, "pos": pos,
                                "carrier_individuals": int(car.any(1).sum()),
                                "unphased_het_carriers": int(unph.sum()),
                                "missing_individuals": int((g == -1).all(1).sum())})
 
+    # a non-carrier is missing only when no entry calls it: a split MEI often has a sparse
+    # record that is "./." for most samples, which must not erase their calls elsewhere
     state = np.zeros((n, 2), dtype=np.int8)
     state[carrier] = 1
-    state[~carrier & any_missing] = -1
     state[~carrier & ~called] = -1
     # a carrier with an unphased call goes on its first haplotype until the tree places it
     for i in np.flatnonzero(unphased):

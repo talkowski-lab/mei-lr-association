@@ -1,10 +1,10 @@
 ## Local ARG inference and dating (tsinfer + tsdate) for scripts/sv_age_arg.py, plus
-## bcftools for pulling regions out of gs:// VCFs without localizing them. Debian's
+## bcftools/samtools for pulling regions out of gs:// VCFs and FASTAs without localizing them. Debian's
 ## htslib is built with libcurl/GCS support, so gs:// paths work given GCS_OAUTH_TOKEN.
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bcftools tabix curl ca-certificates \
+        bcftools samtools tabix curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \

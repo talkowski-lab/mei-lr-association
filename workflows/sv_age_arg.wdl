@@ -18,9 +18,8 @@ workflow SVAgeARG {
         FlankBp: "SNVs this far either side of the SV are used to infer the ARG."
         SvExcludePadBp: "Extra exclusion around the SV span, covering imprecise breakpoints."
         SvSearchPadBp: "How far beyond SvStart/SvEnd to look for the SvIds records."
-        AncestralFasta: "Ancestral-allele FASTA (e.g. Ensembl homo_sapiens_ancestor, all chromosomes concatenated; plain or bgzipped). Ensembl ANCESTOR_for_chromosome headers are recognised. Without it (or AncestralInfoField) REF is treated as ancestral and the result is flagged."
-        AncestralFastaIndex: ".fai for AncestralFasta; built on the fly if omitted."
-        AncestralInfoField: "INFO field holding the ancestral allele (e.g. AA); used only if AncestralFasta is not given."
+        AncestralFastaList: "Two-column table like PhasedVcfList: chromosome, path (gs://, https:// or local) of that chromosome's ancestral-allele FASTA, e.g. Ensembl's homo_sapiens_ancestor_7.fa. Must be indexed (<fasta>.fai beside it, plus .gzi if bgzipped; plain gzip cannot be read by region). Only the flank region of Chrom's file is read, remotely, never the whole file. Ensembl ANCESTOR_for_chromosome headers are recognised. Without it (or AncestralInfoField) REF is treated as ancestral and the result is flagged."
+        AncestralInfoField: "INFO field holding the ancestral allele (e.g. AA); used only if AncestralFastaList is not given."
         AncestralHighConfidenceOnly: "Drop SNVs whose ancestral call is lower-case (low confidence) in the FASTA."
         SvType: "INS or DEL. INS: REF is the ancestral allele and the insertion (ALT) is dated. DEL: ALT is the ancestral allele, i.e. the reference sequence (e.g. a reference SVA missing in some people) is the derived insertion and is what gets dated."
         SvAncestralState: "Optional override of SvType's polarity: ref, alt, or auto (whichever parsimony prefers)."
@@ -51,8 +50,7 @@ workflow SVAgeARG {
         Int SvExcludePadBp = 500
         Int SvSearchPadBp = 1000
 
-        File? AncestralFasta
-        File? AncestralFastaIndex
+        File? AncestralFastaList
         String? AncestralInfoField
         Boolean AncestralHighConfidenceOnly = false
         String SvType = "INS"
@@ -88,6 +86,7 @@ workflow SVAgeARG {
             FullVcfList = FullVcfList,
             PhasedVcfIndexList = PhasedVcfIndexList,
             FullVcfIndexList = FullVcfIndexList,
+            AncestralFastaList = AncestralFastaList,
             Chrom = Chrom,
             SvStart = SvStart,
             SvEnd = SvEnd,
@@ -111,8 +110,8 @@ workflow SVAgeARG {
             SvEnd = SvEnd,
             FlankBp = FlankBp,
             SvExcludePadBp = SvExcludePadBp,
-            AncestralFasta = AncestralFasta,
-            AncestralFastaIndex = AncestralFastaIndex,
+            AncestralFasta = ExtractRegion.AncestralFasta,
+            AncestralOffset = ExtractRegion.AncestralOffset,
             AncestralInfoField = AncestralInfoField,
             AncestralHighConfidenceOnly = AncestralHighConfidenceOnly,
             SvType = SvType,
@@ -155,6 +154,7 @@ task ExtractRegion {
         File FullVcfList
         File? PhasedVcfIndexList
         File? FullVcfIndexList
+        File? AncestralFastaList
         String Chrom
         Int SvStart
         Int SvEnd
@@ -188,10 +188,12 @@ task ExtractRegion {
         full_idx=$(lookup "~{default="" FullVcfIndexList}" 0)
         [[ -n "$phased_idx" ]] && phased="${phased}##idx##${phased_idx}"
         [[ -n "$full_idx" ]] && full="${full}##idx##${full_idx}"
+        anc=$(lookup "~{default="" AncestralFastaList}" 1)
         echo "phased VCF: $phased"
         echo "full VCF:   $full"
+        echo "ancestral:  ${anc:-none}"
 
-        if [[ "$phased$full" == *gs://* ]]; then
+        if [[ "$phased$full$anc" == *gs://* ]]; then
             token=$(curl -sf -H "Metadata-Flavor: Google" \
                 "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
                 | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])') \
@@ -200,10 +202,43 @@ task ExtractRegion {
         fi
         ~{if defined(RequesterPaysProject) then "export GCS_REQUESTER_PAYS_PROJECT=" + RequesterPaysProject else ""}
 
+
         lo=$(( ~{SvStart} - ~{FlankBp} )); (( lo < 1 )) && lo=1
         hi=$(( ~{SvEnd} + ~{FlankBp} ))
         slo=$(( ~{SvStart} - ~{SvSearchPadBp} )); (( slo < 1 )) && slo=1
         shi=$(( ~{SvEnd} + ~{SvSearchPadBp} ))
+
+        # only the flank region of the ancestral FASTA is read, remotely like the VCFs; the
+        # .fai is fetched first because Ensembl contig names (ANCESTOR_for_chromosome:GRCh38:7:...)
+        # contain colons and must be named exactly in {name}:start-end form
+        : > ancestral.region.fa
+        echo 0 > ancestral_offset.txt
+        if [[ -n "$anc" ]]; then
+            case "$anc" in
+                gs://*)
+                    hdr=(-H "Authorization: Bearer $GCS_OAUTH_TOKEN")
+                    [[ -n "${GCS_REQUESTER_PAYS_PROJECT:-}" ]] && \
+                        hdr+=(-H "x-goog-user-project: $GCS_REQUESTER_PAYS_PROJECT")
+                    curl -sSf "${hdr[@]}" -o ancestral.fai \
+                        "https://storage.googleapis.com/${anc#gs://}.fai" ;;
+                http://*|https://*) curl -sSfL -o ancestral.fai "$anc.fai" ;;
+                *) cp "$anc.fai" ancestral.fai ;;
+            esac || { echo "Could not read $anc.fai: the ancestral FASTA must be indexed (samtools faidx)" >&2; exit 1; }
+            contig=$(awk -F'\t' -v a="$chrom" -v b="$chrom_n" '
+                { split($1, p, ":") }
+                $1 == a || $1 == b || $1 == "chr" b || (p[1] ~ /^ANCESTOR/ && (p[3] == b || "chr" p[3] == a)) { print $1; exit }
+                ' ancestral.fai)
+            if [[ -z "$contig" && $(grep -c . ancestral.fai) -eq 1 ]]; then
+                contig=$(cut -f1 ancestral.fai)
+            fi
+            if [[ -z "$contig" ]]; then
+                echo "No contig for $chrom in $anc.fai; contigs: $(cut -f1 ancestral.fai | tr '\n' ' ')" >&2
+                exit 1
+            fi
+            samtools faidx "$anc" "{$contig}:$lo-$hi" > ancestral.region.fa
+            echo "$lo" > ancestral_offset.txt
+            echo "ancestral: $contig:$lo-$hi ($(grep -v '^>' ancestral.region.fa | tr -d '\n' | wc -c) bp)"
+        fi
 
         bcftools query -l "$phased" > phased_samples.txt
         bcftools view --no-version -r "$chrom:$lo-$hi" -v snps -m2 -M2 "$phased" \
@@ -241,6 +276,8 @@ task ExtractRegion {
         File SvPhasedVcf = "sv.phased.vcf.gz"
         File SvFullVcf = "sv.full.vcf.gz"
         File Counts = "extract_counts.tsv"
+        File AncestralFasta = "ancestral.region.fa"
+        Int AncestralOffset = read_int("ancestral_offset.txt")
     }
 }
 
@@ -256,8 +293,8 @@ task InferAndDate {
         Int SvEnd
         Int FlankBp
         Int SvExcludePadBp
-        File? AncestralFasta
-        File? AncestralFastaIndex
+        File AncestralFasta
+        Int AncestralOffset
         String? AncestralInfoField
         Boolean AncestralHighConfidenceOnly
         String SvType
@@ -282,6 +319,10 @@ task InferAndDate {
 
     command <<<
         set -euo pipefail
+        anc_args=()
+        if [[ -s "~{AncestralFasta}" ]]; then
+            anc_args=(--ancestral-fasta "~{AncestralFasta}" --ancestral-offset ~{AncestralOffset})
+        fi
         python3 /scripts/sv_age_arg.py \
             --phased-vcf ~{RegionPhasedVcf} \
             --singleton-vcf ~{RegionSingletonVcf} \
@@ -293,8 +334,7 @@ task InferAndDate {
             --sv-end ~{SvEnd} \
             --flank ~{FlankBp} \
             --exclude-pad ~{SvExcludePadBp} \
-            ~{"--ancestral-fasta " + AncestralFasta} \
-            ~{"--ancestral-fasta-index " + AncestralFastaIndex} \
+            "${anc_args[@]}" \
             ~{"--ancestral-info-field " + AncestralInfoField} \
             ~{if AncestralHighConfidenceOnly then "--ancestral-high-confidence-only" else ""} \
             --sv-type ~{SvType} \
