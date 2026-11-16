@@ -269,3 +269,11 @@ workflows:
         - main
       tags:
         - /.*/
+  - subclass: WDL
+    name: SVAAnnotationTable
+    primaryDescriptorPath: /workflows/sva_annotation_table.wdl
+    filters:
+      branches:
+        - main
+      tags:
+        - /.*/
