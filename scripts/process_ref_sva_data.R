@@ -159,6 +159,25 @@ med_gt_tidy <- med_gt_tidy %>%
   left_join(sva_med %>% select(-SVLEN, -subfamily))
 
 
+# rMEI genotypes in the layout of the nrMEI tidy table (cluster_mei_gt.R),
+# taken as-is from the matched MED record in the SV VCF. ALT is the deletion,
+# so hap1/hap2 = TRUE means that haplotype LACKS the reference SVA.
+gt_allele <- function(gt, i) {
+  a <- stringr::str_split_i(gt, "[|/]", i)
+  if_else(is.na(a) | a == ".", NA, a != "0")
+}
+
+ref_sva_gt_tidy <- med_gt_tidy %>%
+  filter(!is.na(sva_id), !is.na(GT), !(GT %in% c(".", "./.", ".|."))) %>%
+  mutate(indiv = as.character(indiv), hap1 = gt_allele(GT, 1), hap2 = gt_allele(GT, 2)) %>%
+  select(CHROM, POS, ID, sva_id, indiv, GT, hap1, hap2) %>%
+  distinct() %>%
+  arrange(CHROM, POS, ID, sva_id, indiv)
+
+ref_sva_gt_tidy %>%
+  write_tsv("rMEI_SVA_gt_tidy.txt.gz")
+
+
 # Per (indiv, sva_id), sum the assembly-derived repeat lengths across
 # whichever haplotype rows are present. n_GT_INS is just the haplotype-row
 # count (<=2); it gets replaced below by n_pres_INS, the count of haplotypes
