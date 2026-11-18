@@ -204,7 +204,18 @@ task DelimToParquet {
 import polars as pl
 
 has_header = "~{HasHeader}" == "true"
-df = pl.read_csv("~{InputFile}", separator="~{Delimiter}", has_header=has_header)
+df = pl.read_csv(
+    "~{InputFile}",
+    separator="~{Delimiter}",
+    has_header=has_header,
+    null_values=["NA"],
+    infer_schema_length=None,
+)
+# An all-missing column would otherwise infer as String and clash with other
+# batches' numeric types when ConcatParquet merges them.
+df = df.with_columns(
+    pl.col(c).cast(pl.Null) for c in df.columns if df.height > 0 and df[c].null_count() == df.height
+)
 df.write_parquet("~{OutputName}")
 CODE
   >>>
@@ -252,7 +263,7 @@ out_path = "~{OutputName}"
 with open("input_files_manifest.txt") as f:
     files = [line.strip() for line in f if line.strip()]
 
-pl.concat([pl.scan_parquet(fp) for fp in files], how="vertical").sink_parquet(out_path)
+pl.concat([pl.scan_parquet(fp) for fp in files], how="vertical_relaxed").sink_parquet(out_path)
 CODE
   >>>
 
