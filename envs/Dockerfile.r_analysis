@@ -5,7 +5,7 @@ FROM rocker/verse:4.4.1
 ## AnVIL and AnVILGCP are Bioconductor (not CRAN) packages -- installing them
 ## via install.packages() silently no-ops (it only warns on missing packages,
 ## it doesn't fail the build), so they must go through BiocManager instead.
-RUN R -e "install.packages(c('optparse', 'argparser', 'jsonlite', 'data.table', 'ggplot2', 'ggthemes', 'glue', 'arrow', 'stringdist', 'ape', 'circlize', 'BiocManager'), repos = 'https://cloud.r-project.org')" \
+RUN R -e "install.packages(c('optparse', 'argparser', 'jsonlite', 'data.table', 'ggplot2', 'ggthemes', 'patchwork', 'glue', 'arrow', 'stringdist', 'ape', 'circlize', 'BiocManager'), repos = 'https://cloud.r-project.org')" \
     && R -e "BiocManager::install(c('Biostrings', 'DECIPHER', 'GenomicRanges', 'AnVIL', 'AnVILGCP'), update = FALSE, ask = FALSE)"
 
 ## Build samtools/bcftools from source with --enable-libcurl so htslib's remote
@@ -37,9 +37,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ## External tools the Rmd reports shell out to: minimap2 (transduction source
 ## mapping and SINE-R location), mafft (reference-guided MSA), mmseqs2/vsearch
 ## (clustering), fasttree (installs `fasttree` + multithreaded `fasttreeMP`),
-## bedtools (per-window GC via `bedtools nuc` for the enrichment report).
+## bedtools (per-window GC via `bedtools nuc` for the enrichment report),
+## ncbi-blast+ (blastn-short of short transduction pieces against source flanks).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        minimap2 mafft mmseqs2 vsearch fasttree bedtools \
+        minimap2 mafft mmseqs2 vsearch fasttree bedtools ncbi-blast+ \
     && rm -rf /var/lib/apt/lists/*
 
 ## rocker/verse ships TinyTeX, which is minimal: pandoc's default LaTeX

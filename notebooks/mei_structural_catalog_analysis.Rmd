@@ -1,0 +1,914 @@
+---
+title: "MEI structural catalog and transduction sources"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4)
+for (p in c("ggthemes", "circlize")) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cloud.r-project.org")
+}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringi)
+  library(ggplot2)
+  library(ggthemes)
+  library(circlize)
+})
+
+## Publication style: theme_clean without its outer border, larger black
+## axis text, legends below the panel, no in-plot titles (the section
+## headings and figure files carry those).
+theme_pub <- function(base_size = 11) {
+  theme_clean(base_size = base_size) +
+    theme(plot.background = element_rect(fill = "white", colour = NA),
+          legend.background = element_rect(fill = NA, colour = NA),
+          legend.key = element_rect(fill = NA, colour = NA),
+          legend.position = "bottom",
+          legend.title = element_text(face = "plain"),
+          axis.text = element_text(colour = "black", size = rel(0.9)),
+          axis.title = element_text(size = rel(1)),
+          strip.text = element_text(face = "bold", size = rel(1)),
+          strip.background = element_blank(),
+          panel.grid.major.y = element_line(colour = "grey85", linetype = "dotted"),
+          plot.margin = margin(6, 10, 6, 6))
+}
+theme_set(theme_pub())
+
+source("utils.R")
+gc_bucket <- Sys.getenv("GCLOUD_BUCKET")
+set_gcloud_bucket(gc_bucket)
+
+## fread that also reads .gz without needing R.utils
+fread_any <- function(path, ...) {
+  if (grepl("\\.gz$", path)) fread(cmd = paste("gzip -dc", shQuote(path)), ...) else fread(path, ...)
+}
+
+## Minimum variants for a subfamily to get its own row in the heatmap
+min_subfamily_n <- 20
+
+fig_dir <- Sys.getenv("FIGURES_DIR", "figures")
+tab_dir <- Sys.getenv("TABLES_DIR", "tables")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
+fig_base <- function(name) file.path(fig_dir, paste0("structure_", name))
+save_fig <- function(p, name, w = 7, h = 4) {
+  ggsave(paste0(fig_base(name), ".pdf"), p, width = w, height = h)
+  ggsave(paste0(fig_base(name), ".png"), p, width = w, height = h, dpi = 300, bg = "white")
+  print(p)
+}
+save_tab <- function(d, name) fwrite(d, file.path(tab_dir, paste0("structure_", name, ".tsv")), sep = "\t", na = "NA")
+
+wilson_ci <- function(k, n, z = 1.96) {
+  p <- ifelse(n > 0, k / n, NA_real_)
+  denom <- 1 + z^2 / n
+  centre <- (p + z^2 / (2 * n)) / denom
+  half <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / denom
+  list(lo = pmax(0, centre - half), hi = pmin(1, centre + half))
+}
+
+## Okabe-Ito, colour-blind safe
+FAMILY_COLORS <- c(Alu = "#0072B2", L1 = "#D55E00", SVA = "#009E73", unknown = "#999999")
+OUTCOME_LABELS <- c(assigned_fixed = "Fixed source element", assigned_polymorphic = "Polymorphic source element",
+                    unique = "Unique locus, no element", multi = "Multi-mapping locus",
+                    shared_unmapped = "Shared non-reference source", self_only = "Maps only to insertion site",
+                    unmapped = "Unmapped")
+OUTCOME_COLORS <- setNames(c("#0072B2", "#D55E00", "#56B4E9", "#CC79A7", "#E69F00", "#999999", "#D9D9D9"), OUTCOME_LABELS)
+SOURCE_TYPE_COLORS <- c("Fixed" = "#0072B2", "Polymorphic" = "#D55E00", "No element identified" = "#999999")
+source_type_label <- function(t) factor(fifelse(t %in% "fixed", "Fixed", fifelse(t %in% "polymorphic", "Polymorphic",
+                                                                               "No element identified")),
+                                        levels = names(SOURCE_TYPE_COLORS))
+FLAGS <- c(full_length = "Full-length", five_prime_truncated = "5' truncation",
+           three_prime_transduction = "3' transduction", five_prime_inversion = "5' inversion",
+           five_prime_transduction = "5' transduction", internal_priming = "Internal priming",
+           exon_trapping_candidate = "Exon-trapping", three_prime_truncated = "3' truncation",
+           premature_polyadenylation = "Premature pA", internal_deletion = "Internal deletion",
+           internal_rearrangement = "Internal rearrangement", orphan_candidate = "Orphan candidate",
+           snRNA_chimera = "snRNA chimera", terminal_polyA = "Terminal poly(A)", internal_polyA = "Internal poly(A)")
+pct <- scales::label_percent(accuracy = 1)
+comma <- scales::label_comma()
+## Long comma-joined id lists are unbreakable for LaTeX and exhaust pdflatex's memory.
+clip_list <- function(x, k = 3) vapply(strsplit(ifelse(is.na(x), "", x), ",", fixed = TRUE), function(v)
+  if (!length(v)) NA_character_ else if (length(v) <= k) paste(v, collapse = ", ")
+  else sprintf("%s, ... (%d total)", paste(v[1:k], collapse = ", "), length(v)), "")
+fam_scale_fill <- function(...) scale_fill_manual(values = FAMILY_COLORS, ...)
+fam_scale_col <- function(...) scale_colour_manual(values = FAMILY_COLORS, ...)
+```
+
+# Download catalog outputs
+
+```{r download-catalog}
+catalog_dir <- "scratch/alex/pipeline_outputs/mei_structural_catalog"
+catalog_prefix <- "mei"
+catalog_file <- function(name) glue::glue("{catalog_dir}/{catalog_prefix}.structure_{name}")
+
+per_var <- fread_any(gs_download(catalog_file("per_variant.tsv")), sep = "\t")
+per_seq <- fread_any(gs_download(catalog_file("per_sequence.tsv.gz")), sep = "\t")
+
+# Only written when the workflow ran with Reference or TransductionPaf; the
+# source-tracing section is skipped without them.
+download_optional <- function(path) {
+  f <- tryCatch(gs_download(path), error = function(e) NULL)
+  if (is.null(f) || !file.exists(f)) {
+    message("not available, skipping: ", path)
+    return(NULL)
+  }
+  f
+}
+src_file <- download_optional(catalog_file("transduction_sources.tsv"))
+srcsum_file <- download_optional(catalog_file("source_summary.tsv"))
+src <- if (!is.null(src_file)) fread_any(src_file, sep = "\t") else NULL
+srcsum <- if (!is.null(srcsum_file)) fread_any(srcsum_file, sep = "\t") else NULL
+td_file <- download_optional(catalog_file("transductions.tsv"))
+tdseg_file <- download_optional(catalog_file("transduction_segments.tsv"))
+tdx <- if (!is.null(td_file)) fread_any(td_file, sep = "\t") else NULL
+tdseg <- if (!is.null(tdseg_file)) fread_any(tdseg_file, sep = "\t") else NULL
+```
+
+```{r inputs}
+for (f in intersect(names(FLAGS), names(per_var))) per_var[, (f) := as.logical(get(f)) %in% TRUE]
+if (!is.null(per_seq)) for (f in intersect(names(FLAGS), names(per_seq))) per_seq[, (f) := as.logical(get(f)) %in% TRUE]
+has_seq <- !is.null(per_seq)
+has_src <- !is.null(src) && nrow(src) > 0
+has_tdx <- !is.null(tdx) && nrow(tdx) > 0 && !is.null(tdseg)
+fams <- intersect(c("Alu", "L1", "SVA"), unique(per_var$family))
+per_var[, family := factor(family, levels = fams)]
+cat(sprintf("%d variants across %s.\n", nrow(per_var),
+            paste(sprintf("%s: %d", names(table(per_var$family)), table(per_var$family)), collapse = ", ")))
+```
+
+# Overview
+
+This report summarises the structural catalog produced by the
+`MEIStructuralCatalog` workflow (`scripts/mei_structural_catalog.R`). The
+catalog assigns each non-reference Alu, L1 and SVA insertion to the
+structural forms of retrotransposition in Hancks & Kazazian 2016
+(*Mobile DNA* 7:9), Fig. 2 panels b-i. Every call is made from the
+RepeatMasker hits L1ME-AID stores per sequence, after flipping each sequence
+into element-sense orientation so that 5' and 3' refer to the element's own
+ends.
+
+| Panel | Form | Call |
+|---|---|---|
+| b | full-length | neither end is missing more than `max_5p/3p_missing` bp of consensus, and there is no 5' inversion |
+| c | 5' truncation | consensus start of the 5'-most sense hit, minus 1, is greater than `max_5p_missing` |
+| d | 3' transduction | >= `min_transduction` bp of unique sequence between the element's 3' end (or its first poly(A)) and a terminal poly(A) |
+| e | 5' inversion | >= `min_inversion` bp of same-family sequence on the opposite strand, 5' of the sense portion (twin priming) |
+| f | 5' transduction | unique sequence joined to an intact element 5' end |
+| g | internal priming | 3'-truncated element whose last 20 bp are >= 70% A |
+| h | exon-trapping | unique 5' sequence joined to an internally starting (5'-truncated) element |
+| i | 3' truncation | consensus missing at the 3' end; the subset with a PAS 10-35 nt upstream of an added poly(A) is flagged as premature polyadenylation |
+
+A variant is one insertion (a `var_id` of the clustered allele table), and
+its sequences are its **distinct alleles**. The catalog rolls them up to the
+modal structure, majority flags and median lengths, weighting each allele by
+the haplotypes that carry it, so the rollup describes the form most people
+carry. AF and carrier counts come from the genotype table.
+
+```{r weighting, results = "asis"}
+cat(sprintf("%d variants, %d with at least one carrier, median %s carriers.\n",
+            nrow(per_var), sum(per_var$n_carriers > 0), format(median(per_var$n_carriers))))
+```
+
+Every figure is written to `r fig_dir`/ as a vector PDF and a 300 dpi PNG,
+and every table to `r tab_dir`/, all prefixed `structure_`.
+
+# Prevalence of structural forms
+
+Share of variants with each structural feature, per family. Error bars are
+95% Wilson intervals; prevalence is computed per **variant**, so a common
+insertion counts once. Each label carries the number of variants with that
+feature: summed over families in the combined plot, and for that family alone
+in the per-family plots that follow it.
+
+```{r prevalence, fig.width = 7, fig.height = 6}
+flags <- intersect(names(FLAGS), names(per_var))
+props <- rbindlist(lapply(split(per_var, per_var$family, drop = TRUE), function(d) {
+  rbindlist(lapply(flags, function(f) {
+    k <- sum(d[[f]]); n <- nrow(d); ci <- wilson_ci(k, n)
+    data.table(family = as.character(d$family[1]), feature = f, label = FLAGS[[f]], k = k, n = n, prop = k / n,
+               ci_lo = ci$lo, ci_hi = ci$hi)
+  }))
+}))
+save_tab(props, "feature_proportions")
+with_n <- function(lab, k) sprintf("%s (n=%s)", lab, comma(k))
+## label rows top to bottom in FLAGS order, each carrying its variant count
+n_labels <- function(d) {
+  k <- d[, .(k = sum(k)), by = label]
+  k <- k[match(unname(FLAGS), label)][!is.na(label)]
+  factor(with_n(d$label, k$k[match(d$label, k$label)]), levels = rev(with_n(k$label, k$k)))
+}
+props[, label_n := n_labels(props)]
+props[, label := factor(label, levels = rev(unname(FLAGS)))]
+props[, family := factor(family, levels = rev(fams))]
+prev_grid <- theme(panel.grid.major.y = element_blank(),
+                   panel.grid.major.x = element_line(colour = "grey85", linetype = "dotted"))
+p <- ggplot(props, aes(prop, label_n, fill = family)) +
+  geom_col(position = position_dodge(0.8), width = 0.75) +
+  geom_errorbar(aes(xmin = ci_lo, xmax = ci_hi), position = position_dodge(0.8), width = 0.35,
+                linewidth = 0.35, orientation = "y") +
+  scale_x_continuous(labels = pct, expand = expansion(mult = c(0, 0.04))) +
+  fam_scale_fill(breaks = fams) +
+  labs(x = "Variants with feature", y = NULL, fill = NULL) +
+  prev_grid
+save_fig(p, "feature_proportions", 7, 6)
+
+for (fm in fams) {
+  d <- props[family == fm]
+  d[, label_n := n_labels(d)]
+  p <- ggplot(d, aes(prop, label_n)) +
+    geom_col(width = 0.7, fill = FAMILY_COLORS[[fm]]) +
+    geom_errorbar(aes(xmin = ci_lo, xmax = ci_hi), width = 0.3, linewidth = 0.35, orientation = "y") +
+    scale_x_continuous(labels = pct, expand = expansion(mult = c(0, 0.04))) +
+    labs(x = sprintf("%s variants with feature (of %s)", fm, comma(d$n[1])), y = NULL) +
+    prev_grid
+  save_fig(p, paste0("feature_proportions_", fm), 6, 5)
+}
+props[, family := factor(family, levels = fams)]
+knitr::kable(dcast(props, label ~ family, value.var = "prop", fun.aggregate = function(x) round(100 * x, 1))[order(-label)],
+             caption = "Percent of variants with each feature")
+```
+
+```{r combos}
+combos <- per_var[, .N, by = .(family, structure)][order(family, -N)]
+save_tab(combos, "combinations")
+knitr::kable(combos[, head(.SD, 6), by = family], caption = "Most common structure combinations")
+```
+
+# Truncation
+
+Cumulative distribution of the fraction of the consensus each insertion
+retains (5' truncation profile), the number of consensus bases missing at the
+5' end, and insertion length.
+
+```{r truncation-cdf, fig.width = 5, fig.height = 4}
+tr <- per_var[!is.na(retained_cons_frac)]
+if (nrow(tr)) {
+  p <- ggplot(tr, aes(retained_cons_frac, colour = family)) + stat_ecdf(linewidth = 0.8) +
+    scale_x_continuous(labels = pct) + scale_y_continuous(labels = pct) + fam_scale_col() +
+    labs(x = "Consensus retained", y = "Cumulative share of insertions", colour = NULL)
+  save_fig(p, "five_prime_truncation_cdf", 5, 4)
+}
+```
+
+```{r truncation-hist, fig.width = 7, fig.height = 3.2}
+if (any(!is.na(per_var$five_prime_missing))) {
+  p <- ggplot(per_var[!is.na(five_prime_missing)], aes(five_prime_missing, fill = family)) +
+    geom_histogram(bins = 50, colour = "white", linewidth = 0.1) +
+    facet_wrap(~family, nrow = 1, scales = "free") + fam_scale_fill(guide = "none") +
+    scale_x_continuous(labels = comma) + scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.05))) +
+    labs(x = "Consensus bp missing at the 5' end", y = "Insertions")
+  save_fig(p, "five_prime_missing_hist", 7, 3.2)
+}
+p <- ggplot(per_var, aes(L, fill = family)) + geom_histogram(bins = 50, colour = "white", linewidth = 0.1) +
+  scale_x_log10(labels = comma) + scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.05))) +
+  facet_wrap(~family, nrow = 1, scales = "free_y") + fam_scale_fill(guide = "none") +
+  labs(x = "Insertion length (bp)", y = "Insertions")
+save_fig(p, "insertion_length_hist", 7, 3.2)
+mech <- per_var[three_prime_truncated == TRUE, .N, by = .(family,
+  mechanism = fifelse(internal_priming, "internal priming (g)",
+              fifelse(premature_polyadenylation, "premature pA (i)", "unclassified")))]
+if (nrow(mech)) knitr::kable(mech, caption = "Mechanism of 3' truncations")
+```
+
+# 5' inversions and poly(A) tails
+
+Length of the inverted 5' segment against the rest of the insertion for
+twin-priming events, and terminal poly(A) length.
+
+```{r inversions, fig.width = 5, fig.height = 4}
+inv <- per_var[five_prime_inversion == TRUE]
+if (nrow(inv)) {
+  p <- ggplot(inv, aes(inversion_len, L - inversion_len, colour = family)) + geom_point(size = 1.2, alpha = 0.7) +
+    scale_x_continuous(labels = comma) + scale_y_continuous(labels = comma) + fam_scale_col() +
+    labs(x = "Inverted 5' segment (bp)", y = "Sense segment + tail (bp)", colour = NULL)
+  save_fig(p, "five_prime_inversions", 5, 4)
+  if (has_seq) {
+    jn <- per_seq[five_prime_inversion == TRUE & !is.na(inversion_junction),
+                  .(median_junction = as.numeric(median(inversion_junction)), frac_deletion = mean(inversion_junction > 0),
+                    frac_duplication = mean(inversion_junction < 0)), by = family]
+    print(knitr::kable(jn, caption = "Inversion junction: >0 = deletion, <0 = duplication between inverted and sense segments"))
+  }
+}
+```
+
+```{r polya, fig.width = 7, fig.height = 3.2}
+if (any(per_var$terminal_polyA)) {
+  p <- ggplot(per_var[terminal_polyA == TRUE], aes(polyA_len, fill = family)) +
+    geom_histogram(bins = 40, colour = "white", linewidth = 0.1) +
+    facet_wrap(~family, nrow = 1, scales = "free_y") + fam_scale_fill(guide = "none") +
+    scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.05))) +
+    labs(x = "Terminal poly(A) length (bp)", y = "Insertions")
+  save_fig(p, "polyA_length_hist", 7, 3.2)
+}
+```
+
+# Transductions
+
+Length of transduced sequence, by family and by end.
+
+```{r transductions, fig.width = 7, fig.height = 4.5}
+td <- rbind(per_var[three_prime_transduction == TRUE | orphan_candidate == TRUE, .(family, kind = "3' transduction", len = tdx3_len)],
+            per_var[five_prime_transduction == TRUE | exon_trapping_candidate == TRUE, .(family, kind = "5' transduction", len = tdx5_len)])
+if (nrow(td)) {
+  p <- ggplot(td[!is.na(len)], aes(len, fill = family)) + geom_histogram(bins = 40, colour = "white", linewidth = 0.1) +
+    scale_x_log10(labels = comma) + scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.05))) +
+    facet_grid(kind ~ family, scales = "free_y") + fam_scale_fill(guide = "none") +
+    labs(x = "Transduced sequence (bp)", y = "Insertions")
+  save_fig(p, "transduction_length", 7, 4.5)
+  knitr::kable(td[, .(n = .N, median_bp = as.numeric(median(len, na.rm = TRUE))), by = .(family, kind)],
+               caption = "Transductions per family")
+} else {
+  cat("No transductions were called.\n")
+}
+```
+
+# Subfamilies and allele frequency
+
+Share of variants with each feature, per subfamily with at least
+`r min_subfamily_n` variants.
+
+```{r subfamily, fig.width = 7.5, fig.height = 7}
+min_n <- min_subfamily_n
+heat_f <- intersect(c("full_length", "five_prime_truncated", "three_prime_truncated", "five_prime_inversion",
+                      "three_prime_transduction", "five_prime_transduction", "internal_priming", "exon_trapping_candidate"),
+                    names(per_var))
+sf <- per_var[, c(list(n = .N), lapply(.SD, mean)), by = .(family, subfamily), .SDcols = heat_f][n >= min_n]
+if (nrow(sf)) {
+  save_tab(sf, "subfamily_features")
+  hm <- melt(sf, id.vars = c("subfamily", "n", "family"), variable.name = "feature", value.name = "frac")
+  hm[, feature := factor(FLAGS[as.character(feature)], levels = unname(FLAGS[heat_f]))]
+  hm[, ylab := sprintf("%s (n = %s)", subfamily, comma(n))]
+  hm[, ylab := factor(ylab, levels = rev(unique(ylab[order(family, subfamily)])))]
+  h <- max(3, 0.24 * nrow(sf) + 2)
+  p <- ggplot(hm, aes(feature, ylab, fill = frac)) + geom_tile(colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = round(100 * frac), colour = frac > 0.6), size = 2.6, show.legend = FALSE) +
+    scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black")) +
+    scale_fill_gradient(low = "#F7FBFF", high = "#08306B", limits = c(0, 1), labels = pct) +
+    facet_grid(family ~ ., scales = "free_y", space = "free_y") +
+    scale_x_discrete(position = "top") +
+    labs(x = NULL, y = NULL, fill = "Variants with feature") +
+    theme(axis.text.x.top = element_text(angle = 40, hjust = 0, vjust = 0), panel.grid.major.y = element_blank(),
+          strip.text.y = element_text(angle = 0), legend.key.width = unit(1.2, "cm"))
+  save_fig(p, "subfamily_heatmap", 7.5, h)
+} else {
+  cat(sprintf("No subfamily has >= %d variants (min_subfamily_n).\n", min_n))
+}
+```
+
+Allele frequency of variants carrying each structural feature.
+
+```{r af, fig.width = 7.5, fig.height = 4}
+has_af <- "af" %in% names(per_var) && any(!is.na(per_var$af) & per_var$af > 0)
+if (has_af) {
+  af_long <- melt(per_var[!is.na(af) & af > 0], id.vars = c("variant_id", "family", "af"),
+                  measure.vars = c("full_length", "five_prime_truncated", "five_prime_inversion",
+                                   "three_prime_transduction", "five_prime_transduction"))[value == TRUE]
+  af_long[, feature := factor(FLAGS[as.character(variable)], levels = unname(FLAGS))]
+  p <- ggplot(af_long, aes(feature, af, fill = family)) +
+    geom_boxplot(outlier.size = 0.4, linewidth = 0.35, alpha = 0.85, width = 0.7) +
+    scale_y_log10(labels = scales::label_number(drop0trailing = TRUE)) +
+    facet_wrap(~family, nrow = 1) + fam_scale_fill(guide = "none") +
+    labs(x = NULL, y = "Allele frequency") +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1))
+  save_fig(p, "af_by_structure", 7.5, 4)
+} else {
+  cat("No variant has a non-zero allele frequency, so the AF analyses are skipped.\n")
+}
+```
+
+# Agreement with INTACT_MEI
+
+INTACT_MEI flags a sequence `INTACT` when both element ends are within 50 bp
+of the consensus and `INTACT_3end` when only the 3' end is. The catalog makes
+its own full-length call with the same 50 bp threshold (L1/SVA; 20 bp for
+Alu) but from independently parsed hits, so the two should agree closely; a
+large disagreement points at a parsing or orientation problem rather than
+biology.
+
+```{r intact}
+if (has_seq && "intact_flag" %in% names(per_seq) && any(!is.na(per_seq$intact_flag))) {
+  ic <- per_seq[, .(n = .N), by = .(family, intact_flag = fifelse(is.na(intact_flag), "(not flagged)", intact_flag),
+                                    catalog = fifelse(full_length, "full_length",
+                                              fifelse(five_prime_truncated, "5' truncated", "other")))]
+  save_tab(ic, "intact_agreement")
+  knitr::kable(dcast(ic, family + intact_flag ~ catalog, value.var = "n", fill = 0),
+               caption = "INTACT_MEI flag (rows) vs catalog call (columns), per sequence")
+} else {
+  cat("No INTACT_MEI flags in the per-sequence table.\n")
+}
+```
+
+# Call concordance within variants
+
+`structure_concordance` is the share of the variant's sequences with its
+modal structure, weighted by carried haplotypes;
+`allele_concordance` is the same share counting each distinct allele once. A
+variant whose carriers mostly agree but whose alleles do not has rare
+divergent alleles, which are more likely allele-calling or assembly errors
+than real structural polymorphism.
+
+```{r concordance, fig.width = 7, fig.height = 3.2}
+m <- per_var[n_sequences > 1]
+if (nrow(m)) {
+  cat(sprintf("%d variants have more than one sequence: mean concordance %.3f, fully concordant %.1f%%.\n",
+              nrow(m), mean(m$structure_concordance), 100 * mean(m$structure_concordance == 1)))
+  p <- ggplot(m, aes(structure_concordance, fill = family)) + geom_histogram(bins = 20, colour = "white", linewidth = 0.1) +
+    facet_wrap(~family, nrow = 1, scales = "free_y") + fam_scale_fill(guide = "none") +
+    scale_x_continuous(labels = pct) + scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.05))) +
+    labs(x = "Carried haplotypes with the modal structure", y = "Variants")
+  save_fig(p, "concordance_hist", 7, 3.2)
+  low <- m[structure_concordance < 0.5][order(structure_concordance)]
+  if (nrow(low)) {
+    save_tab(low, "low_concordance_variants")
+    cols <- intersect(c("variant_id", "family", "subfamily", "n_sequences", "n_carriers", "structure",
+                        "structure_concordance", "allele_concordance"), names(low))
+    knitr::kable(head(low[, ..cols], 15), caption = "Least concordant variants (candidates for allele or annotation errors)")
+  }
+} else {
+  cat("Every variant has a single sequence, so there is no within-variant concordance to report.\n")
+}
+```
+
+# Statistical tests
+
+The tests are:
+
+- chi-square tests of each feature across families
+- within each family (when AF is available), Mann-Whitney tests of AF with vs
+  without each feature
+- Spearman correlations of AF with the retained consensus fraction, poly(A)
+  length and divergence
+
+All p-values are Benjamini-Hochberg adjusted together.
+
+```{r tests}
+tests <- list()
+for (f in flags) {
+  if (length(fams) < 2) break
+  tab <- table(factor(per_var$family, levels = fams), factor(per_var[[f]], levels = c(FALSE, TRUE)))
+  if (all(colSums(tab) > 0)) {
+    ct <- suppressWarnings(chisq.test(tab))
+    tests[[length(tests) + 1]] <- data.table(test = "chi2_across_families", family = "all", feature = f,
+                                             statistic = unname(ct$statistic), p = ct$p.value)
+  }
+}
+if (has_af) for (fm in fams) {
+  d <- per_var[family == fm & !is.na(af)]
+  for (f in flags) {
+    a <- d[get(f) == TRUE, af]; b <- d[get(f) == FALSE, af]
+    if (length(a) >= 5 && length(b) >= 5) {
+      wt <- suppressWarnings(wilcox.test(a, b))
+      tests[[length(tests) + 1]] <- data.table(test = "AF_wilcoxon_with_vs_without", family = fm, feature = f,
+        statistic = unname(wt$statistic), p = wt$p.value, median_with = median(a), median_without = median(b),
+        n_with = length(a), n_without = length(b))
+    }
+  }
+  for (col in c("retained_cons_frac", "polyA_len", "divergence")) {
+    x <- d[!is.na(get(col))]
+    if (nrow(x) >= 10 && uniqueN(x[[col]]) > 1 && uniqueN(x$af) > 1) {
+      ct <- suppressWarnings(cor.test(x[[col]], x$af, method = "spearman"))
+      tests[[length(tests) + 1]] <- data.table(test = paste0("spearman_AF_vs_", col), family = fm, feature = col,
+                                               statistic = unname(ct$estimate), p = ct$p.value, n_with = nrow(x))
+    }
+  }
+}
+tests <- rbindlist(tests, fill = TRUE)
+if (nrow(tests)) {
+  tests[, q_bh := p.adjust(p, "BH")]
+  save_tab(tests, "feature_tests")
+  knitr::kable(tests[order(q_bh)][1:min(.N, 20), .(test, family, feature, statistic, p, q_bh)], digits = 4,
+               caption = "Top tests (BH-adjusted)")
+} else {
+  cat("No test had enough data (needs >= 2 families, or allele frequencies).\n")
+}
+```
+
+```{r sources-header, eval = has_src, results = "asis"}
+cat("# Transduction sources\n\n")
+cat("Transduced segments were mapped to the reference with minimap2.",
+    "Hits within `self_window` of the insertion's own site were removed;",
+    "they indicate flanking-sequence capture, not transduction.",
+    "Each remaining hit was assigned to a same-family, same-strand element in the",
+    "expected position: **upstream** for 3' transductions and **downstream** for 5'.",
+    "Candidate elements are the reference RepeatMasker track (**fixed** sources),",
+    "any `known_sources` BEDs, and every insertion in this cohort (**polymorphic**",
+    "sources). A polymorphic source is absent from the reference, but the flank it",
+    "transduces is ordinary reference sequence beside its insertion point, so its",
+    "segments map there with no reference element present; such a locus is",
+    "assigned to the cohort insertion sitting at it in the right orientation.",
+    "Recurrent segments that are unmapped or map only to the insertion site were",
+    "clustered all-vs-all into non-reference clusters, and each unplaced segment",
+    "was also searched against every other cohort insertion's sequence.\n\n")
+```
+
+```{r sources, eval = has_src, fig.width = 7, fig.height = 3.5}
+## outputs from before polymorphic sources were traced: every assigned element was a fixed one
+if (!"source_type" %in% names(src)) src[, source_type := fifelse(!is.na(source_element), "fixed", NA_character_)]
+src[outcome == "assigned_element", outcome := fifelse(source_type %in% "polymorphic", "assigned_polymorphic", "assigned_fixed")]
+if (!is.null(srcsum) && !"source_type" %in% names(srcsum)) {
+  srcsum[unique(src[!is.na(source_locus), .(source_locus, source_type)]), on = "source_locus", source_type := i.source_type]
+}
+src[, kind_label := fifelse(kind == "5p", "5' transduction", "3' transduction")]
+src[, outcome_label := factor(OUTCOME_LABELS[outcome], levels = OUTCOME_LABELS)]
+oc <- src[, .N, by = .(family, kind_label, outcome_label)][, frac := N / sum(N), by = .(family, kind_label)]
+oc[, group := factor(paste(family, kind_label, sep = ", "), levels = rev(sort(unique(paste(family, kind_label, sep = ", ")))))]
+p <- ggplot(oc, aes(frac, group, fill = outcome_label)) + geom_col(width = 0.7) +
+  scale_x_continuous(labels = pct, expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = OUTCOME_COLORS, drop = TRUE) +
+  labs(x = "Transduced segments", y = NULL, fill = NULL) +
+  guides(fill = guide_legend(ncol = 2, byrow = TRUE)) +
+  theme(panel.grid.major.y = element_blank())
+save_fig(p, "transduction_source_outcome", 7, 0.45 * uniqueN(oc$group) + 2.3)
+print(knitr::kable(src[, .N, by = .(family, kind, outcome)][order(family, kind)], caption = "Source tracing outcome"))
+```
+
+```{r top-sources, eval = has_src && !is.null(srcsum) && nrow(srcsum) > 0, fig.width = 6.5, fig.height = 6}
+top <- head(srcsum, 25)
+locus_label <- function(x) {
+  x <- stri_replace_all_fixed(x, "(no_element)", " (no element)")
+  fifelse(startsWith(x, "nonref_cluster_"),
+          paste("Non-reference cluster", as.integer(stri_replace_first_fixed(x, "nonref_cluster_", ""))), x)
+}
+top[, lab := paste0(locus_label(source_locus), fifelse(is.na(source_element), "", paste0("  ", source_element)),
+                    "  [", families, "]")]
+top[, lab := factor(lab, levels = rev(unique(lab)))]
+top[, type := source_type_label(source_type)]
+p <- ggplot(top, aes(n_offspring, lab, colour = type)) +
+  geom_segment(aes(x = 0, xend = n_offspring, yend = lab), linewidth = 0.6) + geom_point(size = 2.4, show.legend = TRUE) +
+  scale_colour_manual(values = SOURCE_TYPE_COLORS, drop = FALSE) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.08))) +
+  labs(x = "Offspring insertions", y = NULL, colour = NULL) +
+  theme(axis.text.y = element_text(size = rel(0.75)), panel.grid.major.y = element_blank())
+save_fig(p, "top_sources", 6.5, 0.22 * nrow(top) + 1.6)
+srcsum[, type := source_type_label(source_type)]
+print(knitr::kable(dcast(srcsum[!startsWith(source_locus, "nonref_cluster_")], families ~ type,
+                         value.var = "n_offspring", fun.aggregate = length, drop = FALSE),
+                   caption = "Source loci by family and source type (mapped loci only)"))
+if ("same_site" %in% names(srcsum)) {
+  nrc <- srcsum[startsWith(source_locus, "nonref_cluster_"),
+                .(cluster = locus_label(source_locus), families, n_offspring, offspring_chroms,
+                  offspring_span_bp, same_site, other_alleles)]
+  if (nrow(nrc)) {
+    save_tab(nrc, "nonref_cluster_check")
+    shown <- head(nrc[order(-n_offspring)], 20)
+    shown[, `:=`(offspring_chroms = clip_list(offspring_chroms), other_alleles = clip_list(other_alleles))]
+    print(knitr::kable(shown, caption = paste(
+      sprintf("Non-reference clusters (%d of %d, most offspring first; all in structure_nonref_cluster_check.tsv).",
+              nrow(shown), nrow(nrc)),
+      "same_site = all offspring within cluster_window of each other, i.e. probably one",
+      "polymorphic site split across variant ids rather than a shared source; other_alleles = other cohort",
+      "insertions whose own sequence carries the clustered segment.")))
+  }
+}
+cum <- data.table(rank = seq_len(nrow(srcsum)),
+                  cumfrac = cumsum(sort(srcsum$n_offspring, decreasing = TRUE)) / sum(srcsum$n_offspring))
+p <- ggplot(cum, aes(rank, cumfrac)) + geom_step(colour = "#0072B2", linewidth = 0.8) + scale_x_log10(labels = comma) +
+  scale_y_continuous(labels = pct, limits = c(0, 1)) +
+  labs(x = "Source rank (most active first)", y = "Cumulative share of offspring")
+save_fig(p, "source_activity_cumulative", 5, 4)
+top10 <- sum(head(sort(srcsum$n_offspring, decreasing = TRUE), max(1, nrow(srcsum) %/% 10))) / sum(srcsum$n_offspring)
+cat(sprintf("%d distinct sources; the top 10%% account for %.1f%% of traced offspring (cf. hot-L1 skew: Brouha 2003, Gardner 2017).\n",
+            nrow(srcsum), 100 * top10))
+print(knitr::kable(head(srcsum[, .(source_locus, source_element, n_offspring, kinds, families)], 15),
+                   caption = "Most prolific sources"))
+```
+
+## Concatenated transductions
+
+A source element can itself carry a transduction, so its offspring carry
+sequence from more than one source locus (Kirby et al. 2025, Mobile DNA
+16:42). Each transduced segment was split into sub-segments that tile it,
+numbered from the element outward: the innermost is the oldest inherited
+piece, the outermost the immediate source's flank. A sub-segment is traced
+when it maps uniquely or sits beside a source element; an inherited piece
+nested at the inner end of an alignment to a different locus (the immediate
+source still carries it) is split off. Flags: concatenated (two or more
+source loci), single source (one locus, fully traced), single source partial
+(one locus plus untraced stretches), insertion site only, untraced. For 3'
+events, a poly(A) at the outer end of an inner sub-segment is the immediate
+source's own tail and supports the concatenation. Stretches too short or too
+repetitive to place genome-wide were searched again against the repeat-masked
+2 kb flanks of candidate source elements only (n_flank_placed).
+
+```{r concatenated, eval = has_tdx, fig.width = 7, fig.height = 3.5}
+## Sub-segments outermost first, grouped into generations: consecutive
+## sub-segments from one source locus (or one untraced run) are one generation,
+## 1 = the immediate source, 2 = the first grandparent; poly(A) linkers and
+## insertion-site captures belong to none.
+seg_generations <- function(tdseg) {
+  g <- tdseg[!status %in% c("polyA", "insertion_site")][order(variant_id, kind, -segment)]
+  g[, key := fifelse(status == "traced", fifelse(is.na(source_locus), paste(chrom, t_start), source_locus), "untraced")]
+  g[, generation := cumsum(c(TRUE, key[-1] != key[-.N])), by = .(variant_id, kind)]
+  g[, key := NULL]
+}
+GEN_LEVELS <- c("Immediate source", "Grandparent", "Older ancestor", "Untraced", "Poly(A)", "Insertion site")
+GEN_COLORS <- setNames(c("#D55E00", "#0072B2", "#009E73", "#BBBBBB", "#F0E442", "#666666"), GEN_LEVELS)
+gen <- seg_generations(tdseg)
+segs_cls <- merge(tdseg, gen[, .(variant_id, kind, segment, generation)], by = c("variant_id", "kind", "segment"), all.x = TRUE)
+segs_cls[, cls := fcase(status == "polyA", "Poly(A)", status == "insertion_site", "Insertion site",
+                        status != "traced", "Untraced", generation == 1L, "Immediate source",
+                        generation == 2L, "Grandparent", default = "Older ancestor")]
+segs_cls[, cls := factor(cls, levels = GEN_LEVELS)]
+
+FLAG_LEVELS <- c(concatenated = "Concatenated (>= 2 source loci)", single_source = "Single source",
+                 single_source_partial = "Single source, partly untraced",
+                 insertion_site_only = "Insertion site only", untraced = "Untraced")
+FLAG_COLORS <- setNames(c("#D55E00", "#0072B2", "#56B4E9", "#E69F00", "#D9D9D9"), FLAG_LEVELS)
+tdx[, kind_label := fifelse(kind == "5p", "5' transduction", "3' transduction")]
+fc <- tdx[, .N, by = .(family, kind_label, flag)][, frac := N / sum(N), by = .(family, kind_label)]
+fc[, flag_label := factor(FLAG_LEVELS[flag], levels = FLAG_LEVELS)]
+fc[, group := factor(paste(family, kind_label, sep = ", "), levels = rev(sort(unique(paste(family, kind_label, sep = ", ")))))]
+p <- ggplot(fc, aes(frac, group, fill = flag_label)) + geom_col(width = 0.7) +
+  scale_x_continuous(labels = pct, expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = FLAG_COLORS, drop = TRUE) +
+  labs(x = "Transduced segments", y = NULL, fill = NULL) +
+  guides(fill = guide_legend(ncol = 2, byrow = TRUE)) +
+  theme(panel.grid.major.y = element_blank())
+save_fig(p, "transduction_concatenation", 7, 0.45 * uniqueN(fc$group) + 2.3)
+print(knitr::kable(dcast(tdx, family + kind ~ flag, value.var = "variant_id", fun.aggregate = length),
+                   caption = "Transduced segments by sub-segment tracing flag"))
+if (!"n_flank_placed" %in% names(tdx)) tdx[, n_flank_placed := NA_integer_]
+cc <- tdx[flag == "concatenated", .(variant_id, family, kind, td_len, n_segments, n_source_loci,
+                                     segment_sources, n_flank_placed, has_inherited_nested, outer_polyA_breaks)]
+save_tab(cc, "concatenated_transductions")
+if (nrow(cc)) {
+  shown <- head(cc[order(-n_source_loci, -td_len)], 25)
+  shown[, segment_sources := stri_replace_all_fixed(segment_sources, ";", "; ")]
+  print(knitr::kable(shown, caption = sprintf(paste(
+    "Concatenated transductions (%d of %d shown; all in structure_concatenated_transductions.tsv).",
+    "segment_sources lists the sub-segments innermost (oldest) first."), nrow(shown), nrow(cc))))
+}
+```
+
+Length of each transduction against the lengths of the sub-segments it is
+built from. Sub-segments are coloured by the generation of their source,
+counted from the outside in: the immediate source's flank, the first
+grandparent's, older ancestors', and stretches with no traced source.
+Poly(A) linkers and insertion-site captures are left out of the sub-segment
+panel.
+
+```{r transduction-lengths, eval = has_tdx, fig.width = 7, fig.height = 5}
+lens <- rbind(
+  tdx[, .(kind_label, panel = "Whole transduction", cls = "Whole transduction", len = td_len)],
+  segs_cls[!cls %in% c("Poly(A)", "Insertion site"),
+           .(kind_label = fifelse(kind == "5p", "5' transduction", "3' transduction"), panel = "Sub-segments",
+             cls = as.character(cls), len = seg_len)])
+lens[, panel := factor(panel, levels = c("Whole transduction", "Sub-segments"))]
+lens[, cls := factor(cls, levels = c("Whole transduction", GEN_LEVELS))]
+p <- ggplot(lens[len > 0], aes(len, fill = cls)) + geom_histogram(bins = 40, colour = "white", linewidth = 0.1) +
+  scale_x_log10(labels = comma) + scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c("Whole transduction" = "grey35", GEN_COLORS), drop = TRUE) +
+  facet_grid(panel ~ kind_label, scales = "free_y") +
+  labs(x = "Length (bp)", y = "Count", fill = NULL)
+save_fig(p, "transduction_segment_lengths", 7, 5)
+print(knitr::kable(lens[, .(n = .N, median_bp = as.numeric(median(len)), mean_bp = round(mean(len))), by = .(kind_label, panel, cls)][
+  order(kind_label, panel, cls)], caption = "Transduction and sub-segment lengths"))
+```
+
+Architecture of the concatenated transductions: one bar per transduction,
+drawn outward from the element (0 bp = the element's end), its length the
+total transduced length, each block a sub-segment labelled with its length
+and coloured by the generation of its source. At most `arch_max` are drawn,
+those with the most source loci and then the longest.
+
+```{r transduction-architecture, eval = has_tdx && any(tdx$flag == "concatenated"), fig.width = 7, fig.height = 6}
+arch_max <- 40
+ids <- head(tdx[flag == "concatenated"][order(-n_source_loci, -td_len)], arch_max)[, .(variant_id, kind, td_len)]
+a <- merge(segs_cls, ids, by = c("variant_id", "kind"))
+a[, `:=`(x0 = fifelse(kind == "3p", seg_start - 1, td_len - seg_end), x1 = fifelse(kind == "3p", seg_end, td_len - seg_start + 1))]
+a[, row := factor(paste0(variant_id, " (", fifelse(kind == "5p", "5'", "3'"), ")"),
+                  levels = rev(unique(ids[, paste0(variant_id, " (", fifelse(kind == "5p", "5'", "3'"), ")")])))]
+tot <- unique(a[, .(row, td_len)])
+p <- ggplot(a) +
+  geom_rect(aes(xmin = x0, xmax = x1, ymin = as.integer(row) - 0.38, ymax = as.integer(row) + 0.38, fill = cls),
+            colour = "white", linewidth = 0.2) +
+  geom_text(data = a[seg_len >= 0.06 * max(td_len)], aes(x = (x0 + x1) / 2, y = as.integer(row), label = seg_len,
+                                                        colour = cls %in% c("Poly(A)", "Untraced")), size = 2.1) +
+  scale_colour_manual(values = c(`TRUE` = "black", `FALSE` = "white"), guide = "none") +
+  geom_text(data = tot, aes(x = td_len, y = as.integer(row), label = paste(comma(td_len), "bp")), hjust = -0.1, size = 2.3) +
+  scale_y_continuous(breaks = seq_along(levels(a$row)), labels = levels(a$row), expand = expansion(add = 0.6)) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = GEN_COLORS, drop = TRUE) +
+  labs(x = "Distance from the element (bp)", y = NULL, fill = NULL) +
+  theme(panel.grid.major.y = element_blank(), axis.text.y = element_text(size = rel(0.7)))
+save_fig(p, "transduction_architecture", 7, 0.2 * nrow(ids) + 1.6)
+```
+
+```{r circos-header, eval = has_src || has_tdx, results = "asis"}
+cat("## Genomic view of transduction sources\n\n")
+cat("One circos plot per family. The outer ring is the hg38 karyotype. Each",
+    "lollipop is a source element, placed at its locus, its height the number of",
+    "offspring insertions carrying its transduced sequence, coloured by whether",
+    "the source is fixed (in the reference) or polymorphic (a cohort insertion).",
+    "Only immediate sources are drawn: each transduction counts once, for the",
+    "source of its outermost sub-segment, the element it was copied from",
+    "directly. The inner sub-segments of a concatenated transduction, sequence",
+    "inherited from older (grandparent) sources, are not drawn, and a",
+    "transduction whose outermost sub-segment is untraced is counted as",
+    "unplaced rather than credited to an inner source.",
+    "The most prolific sources are labelled with element, position and offspring",
+    "count. Outermost sub-segments with no source element, and unplaced ones,",
+    "are not drawn; the centre gives their counts.\n\n")
+cat("A second plot per family (transduction_circos_grandparent) draws the first",
+    "grandparents instead: the source of the next generation inward, i.e. the",
+    "element the immediate source itself inherited its transduction from.",
+    "Consecutive sub-segments from one source locus count as one generation,",
+    "and poly(A) linkers and insertion-site captures as none. Only",
+    "transductions with an inner generation enter it; one whose inner generation",
+    "is untraced or has no source element is counted in the centre, not",
+    "drawn.\n\n")
+```
+
+```{r circos, eval = has_src || has_tdx, fig.width = 6.5, fig.height = 6.5}
+HG38 <- data.frame(
+  chr = paste0("chr", c(1:22, "X", "Y")), start = 0,
+  end = c(248956422, 242193529, 198295559, 190214555, 181538259, 170805979, 159345973, 145138636,
+          138394717, 133797422, 135086622, 133275309, 114364328, 107043718, 101991189, 90338345,
+          83257441, 80373285, 58617616, 64444167, 46709983, 50818468, 156040895, 57227415))
+norm_chr <- function(x) fifelse(startsWith(x, "chr"), x, paste0("chr", x))
+circos_n_labels <- 6
+SRC_TYPES <- c("Fixed", "Polymorphic")
+
+draw_circos <- function(fam, sources, n_td, n_unplaced, what = "traced transductions") {
+  op <- par(mar = c(0.5, 0.5, 0.5, 0.5))
+  on.exit({ circos.clear(); par(op) })
+  circos.par(start.degree = 90, gap.degree = c(rep(1.2, nrow(HG38) - 1), 6),
+             cell.padding = c(0, 0, 0, 0), track.margin = c(0.004, 0.004), points.overflow.warning = FALSE,
+             canvas.xlim = c(-1.05, 1.05), canvas.ylim = c(-1.5, 1.05))
+  circos.genomicInitialize(HG38, plotType = NULL)
+  circos.track(ylim = c(0, 1), track.height = 0.045, bg.border = NA, panel.fun = function(x, y) {
+    circos.rect(CELL_META$xlim[1], 0, CELL_META$xlim[2], 1, col = "grey85", border = "grey45", lwd = 0.4)
+    circos.text(CELL_META$xcenter, CELL_META$ylim[2] + mm_y(3.2), sub("^chr", "", CELL_META$sector.index),
+                cex = 0.75, facing = "inside", niceFacing = TRUE)
+  })
+  top <- head(sources[order(-n)], circos_n_labels)[, rank := .I]
+  ymax <- max(sources$n) * 1.2
+  circos.track(ylim = c(0, ymax), track.height = 0.24, bg.border = NA, bg.col = "grey97", panel.fun = function(x, y) {
+    for (v in pretty(c(0, ymax), 3)[-1]) if (v < ymax) circos.lines(CELL_META$xlim, c(v, v), col = "white", lwd = 0.8)
+    s <- sources[chr == CELL_META$sector.index][order(n)]
+    if (!nrow(s)) return()
+    col <- SOURCE_TYPE_COLORS[as.character(s$type)]
+    circos.segments(s$pos, 0, s$pos, s$n, col = col, lwd = 1)
+    circos.points(s$pos, s$n, pch = 21, col = "white", bg = col, cex = 1.1)
+    tp <- top[chr == CELL_META$sector.index]
+    if (nrow(tp)) circos.text(tp$pos, tp$n + ymax * 0.12, tp$rank, cex = 0.6, font = 2, facing = "downward")
+  })
+  circos.yaxis(side = "left", at = pretty(c(0, ymax), 3), sector.index = HG38$chr[1], labels.cex = 0.5,
+               tick.length = convert_x(0.6, "mm", HG38$chr[1]))
+  n_by <- function(ty) sum(sources$type == ty)
+  text(0, 0.07, fam, cex = 1.6, font = 2)
+  text(0, -0.1, sprintf("%s fixed and %s polymorphic sources\nof %s %s\n(%s with no source element not drawn)",
+                        comma(n_by("Fixed")), comma(n_by("Polymorphic")), comma(n_td), what, comma(n_unplaced)), cex = 0.62)
+  if (nrow(top)) {
+    half <- ceiling(nrow(top) / 2)
+    for (i in seq_len(nrow(top))) {
+      text(if (i <= half) -0.98 else 0.06, -1.27 - 0.075 * ((i - 1) %% half), adj = c(0, 0.5), cex = 0.62,
+           col = SOURCE_TYPE_COLORS[[as.character(top$type[i])]], sprintf("%d  %s", i, top$label[i]))
+    }
+  }
+  legend(0, -1.12, xjust = 0.5, yjust = 0.5, horiz = TRUE, bty = "n", cex = 0.8, pch = 21, pt.cex = 1.4,
+         col = "white", pt.bg = SOURCE_TYPE_COLORS[SRC_TYPES],
+         legend = c("Fixed source element", "Polymorphic source element"))
+}
+
+## generation g of every transduction that has one; outputs without the
+## segments table only have whole-segment tracing, i.e. generation 1
+gen_sources <- function(g) {
+  if (!has_tdx) {
+    return(src[, .(variant_id, family, source_element, source_type, source_locus, source_chrom, source_start)])
+  }
+  o <- seg_generations(tdseg)[generation == g][, .SD[1], by = .(variant_id, kind)]
+  o[status != "traced", `:=`(source_element = NA_character_, source_type = NA_character_, source_locus = NA_character_)]
+  o[, .(variant_id, family, source_element, source_type, source_locus,
+        source_chrom = fifelse(is.na(source_element), NA_character_, chrom),
+        source_start = as.numeric(stri_match_first_regex(source_locus, ":(\\d+)-")[, 2]))]
+}
+
+circos_set <- function(tab, file_prefix, what) {
+  for (fam in fams) {
+    s <- tab[family == fam]
+    s[, type := source_type_label(source_type)]
+    sources <- s[type %in% SRC_TYPES & !is.na(source_chrom) & !is.na(source_start),
+                 .(chr = norm_chr(source_chrom[1]), pos = as.numeric(source_start[1]), n = uniqueN(variant_id),
+                   type = type[1], element = source_element[1]), by = source_locus]
+    off <- sources[!chr %in% HG38$chr, .N]
+    sources <- sources[chr %in% HG38$chr]
+    if (!nrow(sources)) {
+      cat(sprintf("%s: no %s source element on chr1-22/X/Y, so no %s plot.\n\n", fam, what, file_prefix))
+      next
+    }
+    if (off) cat(sprintf("%s: %d source loci off chr1-22/X/Y not drawn.\n\n", fam, off))
+    sources[, label := trimws(sprintf("%s %s:%.1f Mb (n=%d)", fifelse(is.na(element), "", element), sub("^chr", "", chr), pos / 1e6, n))]
+    n_td <- uniqueN(s$variant_id)
+    n_unplaced <- uniqueN(s[!type %in% SRC_TYPES, variant_id])
+    base <- fig_base(paste0(file_prefix, "_", fam))
+    cur <- dev.cur()
+    pdf(paste0(base, ".pdf"), width = 6.5, height = 6.5); draw_circos(fam, sources, n_td, n_unplaced, what); dev.off()
+    png(paste0(base, ".png"), width = 6.5, height = 6.5, units = "in", res = 300, bg = "white")
+    draw_circos(fam, sources, n_td, n_unplaced, what); dev.off()
+    dev.set(cur)
+    draw_circos(fam, sources, n_td, n_unplaced, what)
+  }
+}
+
+circos_set(gen_sources(1L), "transduction_circos", "traced transductions")
+if (has_tdx) {
+  circos_set(gen_sources(2L), "transduction_circos_grandparent", "transductions with an inner generation")
+} else {
+  cat("No transduction_segments table, so no grandparent plot.\n\n")
+}
+```
+
+# Numbers for the text
+
+One row per number quoted in the main text, for the family in `text_family`.
+Truncation lengths are consensus bases missing, over truncated insertions
+only; transduction lengths are over insertions carrying that transduction.
+Source counts are distinct source loci, given for every assigned segment and
+for uniquely mapped segments only (MAPQ >= `min_mapq`), because a
+multi-mapping segment's source can be the wrong copy. The genome-wide count
+of fixed full-length elements needs the RepeatMasker track the workflow used
+(`ref_rmsk`): RepeatMasker fragments sharing an element id are joined, and an
+element is full-length when at most `full_length_max_missing` consensus bases
+are missing at either end (the catalog's own default for SVA).
+
+```{r key-numbers-params}
+text_family <- "SVA"
+## TODO: the UCSC rmsk.txt(.gz) given to the workflow as RefRmsk; "" skips the genome-wide full-length count
+ref_rmsk <- ""
+full_length_max_missing <- 50
+```
+
+```{r key-numbers}
+fv <- per_var[family == text_family]
+summ_bp <- function(x) {
+  x <- x[!is.na(x)]
+  if (!length(x)) return("none")
+  sprintf("mean %s bp (median %s, n = %s)", comma(round(mean(x))), comma(round(median(x))), comma(length(x)))
+}
+share <- function(k, n) sprintf("%s of %s (%.1f%%)", comma(k), comma(n), 100 * k / n)
+key <- list(
+  list("5' truncation, consensus bp missing", summ_bp(fv[five_prime_truncated == TRUE, five_prime_missing]), ""),
+  list("3' truncation, consensus bp missing", summ_bp(fv[three_prime_truncated == TRUE, three_prime_missing]), ""),
+  list("5' transduction length", summ_bp(fv[five_prime_transduction == TRUE | exon_trapping_candidate == TRUE, tdx5_len]), ""),
+  list("3' transduction length", summ_bp(fv[three_prime_transduction == TRUE | orphan_candidate == TRUE, tdx3_len]), ""),
+  list("Either transduction length", summ_bp(c(fv[five_prime_transduction == TRUE | exon_trapping_candidate == TRUE, tdx5_len],
+                                               fv[three_prime_transduction == TRUE | orphan_candidate == TRUE, tdx3_len])), ""),
+  list("Full-length variants", share(sum(fv$full_length), nrow(fv)), ""))
+if (has_src) {
+  s <- src[family == text_family]
+  n_td <- fv[three_prime_transduction | orphan_candidate | five_prime_transduction | exon_trapping_candidate, .N]
+  n_var <- function(d) uniqueN(d$variant_id)
+  loci <- function(d) uniqueN(d[!is.na(source_locus), source_locus])
+  u <- s[mapping == "unique"]
+  key <- c(key, list(
+    list("Variants with a transduction", comma(n_td), ""),
+    list("Variants whose transduced segments were traced", comma(n_var(s)), ""),
+    list("Traced variants mapped to a reference locus", comma(n_var(s[mapping %in% c("unique", "multi")])), comma(n_var(u))),
+    list("Traced variants assigned a source element", comma(n_var(s[!is.na(source_type)])), comma(n_var(u[!is.na(source_type)]))),
+    list("Distinct fixed source elements", comma(loci(s[source_type %in% "fixed"])), comma(loci(u[source_type %in% "fixed"]))),
+    list("Distinct polymorphic source sites", comma(loci(s[source_type %in% "polymorphic"])),
+         comma(loci(u[source_type %in% "polymorphic"])))))
+  rm_file <- if (nzchar(ref_rmsk)) download_optional(ref_rmsk) else NULL
+  if (!is.null(rm_file)) {
+    rm <- fread_any(rm_file, header = FALSE, sep = "\t")
+    if (ncol(rm) < 17) stop("ref_rmsk is not a UCSC rmsk.txt table (17 columns): ", ref_rmsk)
+    rm <- rm[stri_detect_regex(V11, paste0("^", text_family))]
+    ## UCSC rmsk: on "-" the consensus start sits in repLeft and repStart holds -(bases left)
+    rm[, `:=`(miss5 = fifelse(V10 == "+", V14, V16) - 1L, miss3 = abs(fifelse(V10 == "+", V16, V14)))]
+    el <- rm[, .(start = min(V7), end = max(V8), miss5 = min(miss5), miss3 = min(miss3)), by = .(chrom = V6, id = V17)]
+    el[, chrom := fifelse(startsWith(chrom, "chr"), chrom, paste0("chr", chrom))]
+    fl <- el[miss5 <= full_length_max_missing & miss3 <= full_length_max_missing]
+    fl_sources <- function(d) {
+      d <- unique(d[source_type %in% "fixed" & !is.na(source_start),
+                    .(chrom = fifelse(startsWith(source_chrom, "chr"), source_chrom, paste0("chr", source_chrom)),
+                      source_start, source_end)])
+      if (!nrow(d)) return(0L)
+      uniqueN(fl[d, on = .(chrom, start <= source_end, end >= source_start), nomatch = 0, .(chrom, x.start, x.end)])
+    }
+    key <- c(key, list(
+      list(sprintf("Fixed full-length %s elements in the reference", text_family), comma(nrow(fl)), ""),
+      list("Fixed full-length elements that are traced sources", share(fl_sources(s), nrow(fl)),
+           share(fl_sources(u), nrow(fl)))))
+  } else {
+    cat("ref_rmsk not set: the share of the reference's full-length elements that act as sources is not computed.\n")
+  }
+}
+key <- rbindlist(lapply(key, function(r) data.table(quantity = r[[1]], all = r[[2]], uniquely_mapped = r[[3]])))
+save_tab(key, paste0("key_numbers_", text_family))
+knitr::kable(key, col.names = c("Quantity", "All", "Uniquely mapped only"),
+             caption = sprintf("%s numbers quoted in the text", text_family))
+```
+
+# Outputs
+
+```{r outputs}
+out <- data.table(file = c(list.files(fig_dir, "^structure_"), list.files(tab_dir, "^structure_")))
+out[, dir := c(rep(fig_dir, length(list.files(fig_dir, "^structure_"))), rep(tab_dir, length(list.files(tab_dir, "^structure_"))))]
+knitr::kable(out)
+```

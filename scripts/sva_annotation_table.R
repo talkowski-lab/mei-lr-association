@@ -289,8 +289,13 @@ read_bedgraph <- function(path) {
 ## Interval algebra, genome coordinates, the annotation constructors and their
 ## lookups. Kept in one environment, LIB, which is saved into the bundle: the
 ## notebook loads these exact functions, so its null draws use the lookups that
-## built this table. Self-contained (data.table and stringi only) because the
-## notebook evaluates them outside this script.
+## built this table. They use data.table and stringi unqualified, and the
+## notebook attaches neither, so LIB's parent imports both: the functions then
+## resolve those calls wherever the bundle is loaded.
+lib_imports <- new.env(parent = globalenv())
+for (pkg in c("data.table", "stringi")) {
+  for (f in getNamespaceExports(pkg)) assign(f, getExportedValue(pkg, f), envir = lib_imports)
+}
 LIB <- local({
   fread_any <- function(path, ...) {
     if (grepl("\\.gz$", path)) fread(cmd = paste("gzip -dc", shQuote(path)), ...) else fread(path, ...)
@@ -682,7 +687,7 @@ LIB <- local({
   chrom_index <- function(genome, x) findInterval(x, genome$gstart)
 
   environment()
-})
+}, envir = new.env(parent = lib_imports))
 list2env(as.list(LIB), envir = environment())
 
 ## ==== 3. Self-checks of the library =================================================
