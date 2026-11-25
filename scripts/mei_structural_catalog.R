@@ -6,343 +6,40 @@
 ## tests live in notebooks/mei_structural_catalog_analysis.Rmd.
 ##
 ## Outputs (<outdir>/<prefix>.structure_*):
-##   per_sequence.tsv.gz      one row per input sequence, every call
-##   per_variant.tsv          rollup per variant: modal structure, majority flags, medians, concordance
-##   transductions.fa         one transduced segment per variant and kind (variant|kind|family|chrom|pos)
-##   transduction_sources.tsv source tracing per segment     (only with --reference / --transduction-paf)
-##   source_summary.tsv       offspring per source locus     (only with --reference / --transduction-paf)
-##   transductions.tsv        one row per transduced segment: sequence, its sub-segments and their sources, flag (same)
+##   per_sequence.tsv.gz       one row per input sequence, every call
+##   per_variant.tsv           rollup per variant: modal structure, majority flags, medians, concordance
+##   transductions.fa          one transduced segment per variant and kind (variant|kind|family|chrom|pos)
+##   transduction_sources.tsv  source tracing per segment     (only with --reference / --transduction-paf)
+##   source_summary.tsv        offspring per source locus     (same)
+##   transductions.tsv         one row per transduced segment: sequence, its sub-segments and their sources, flag (same)
 ##   transduction_segments.tsv one row per sub-segment, innermost (next to the element) first, with its alignment (same)
+##
+## Inputs. The catalog starts from one row per insertion sequence plus the
+## RepeatMasker hits that annotate it, read from L1ME-AID output TSVs
+## (github.com/Markloftus/L1ME-AID) or the INTACT_MEI `*.limeaid.v134.intact.tsv`
+## (same table, FLAGS column overwritten with INTACT / INTACT_3end). Per-hit
+## query and consensus coordinates exist only in `Element_Hits` (v1.4) /
+## `TE_Hits` (older), stored as a Python-list repr of raw RepeatMasker lines --
+## everything downstream is built on those. Columns are looked up by header
+## name because their names/order drift between L1ME-AID versions. Each
+## sequence is joined to the clustered allele table on chrom + POS + md5 of the
+## sequence, which gives its variant and family (MEI_type), and then to the
+## genotype table on that allele's CHROM + POS + ALT_md5.
+##
+## Everything is dplyr: the largest tables (RepeatMasker hits, genotypes, the
+## reference rmsk) are a few million rows at most, which dplyr handles in
+## seconds.
 
 suppressPackageStartupMessages({
   library(argparser)
-  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(purrr)
   library(stringi)
 })
 
-## ---- Input formats -----------------------------------------------------------
-##
-## The catalog starts from one row per insertion sequence plus the
-## RepeatMasker hits that annotate it, read from L1ME-AID output TSVs
-## (github.com/Markloftus/L1ME-AID) or the INTACT_MEI
-## `*.limeaid.v134.intact.tsv` (same table, FLAGS column overwritten with
-## INTACT / INTACT_3end), normalised to an `ins` table and a long `hits` table.
-## Per-hit query and consensus coordinates exist only in `Element_Hits` (v1.4)
-## / `TE_Hits` (older), stored as a Python-list repr of raw RepeatMasker lines
-## -- everything downstream is built on those. Columns are looked up by header
-## name because their names/order drift between L1ME-AID versions.
-##
-## Each sequence is joined to the clustered allele table on chrom + POS + md5
-## of the sequence, which gives its variant and family (MEI_type), and then to
-## the genotype table on that allele's CHROM + POS + ALT_md5.
-##
-## RepeatMasker coordinates are 1-based inclusive. On 'C'-strand hits the
-## consensus columns are "(left) end begin", so they are re-ordered here and
-## cbeg <= cend always holds afterwards.
-
-## ---- Option coercion (argparser hands every option over as a string) -------
-
-p_num <- function(x) as.numeric(x)
-p_int <- function(x) as.integer(x)
-p_bool <- function(x) isTRUE(as.logical(x)) || identical(tolower(as.character(x)), "true")
-p_str <- function(x) if (is.null(x) || is.na(x) || identical(x, "")) NULL else as.character(x)
-
-## "Alu=20,L1=50" -> named list
-p_map <- function(x) {
-  x <- p_str(x)
-  if (is.null(x)) return(list())
-  kv <- stri_split_fixed(stri_split_fixed(x, ",")[[1]], "=", n = 2)
-  setNames(lapply(kv, function(z) stri_trim_both(z[2])), vapply(kv, function(z) stri_trim_both(z[1]), ""))
-}
-
-which_tool <- function(...) {
-  for (n in c(...)) {
-    if (!is.null(n) && nzchar(n) && nzchar(Sys.which(n))) return(unname(Sys.which(n)))
-  }
-  NULL
-}
-
-run_tool <- function(cmd, args, stdout = "", stderr = FALSE) {
-  status <- system2(cmd, args, stdout = stdout, stderr = stderr)
-  if (!identical(as.integer(status), 0L)) stop(sprintf("%s failed (exit %s)", cmd, status))
-  invisible(status)
-}
-
-## fread that also reads .gz without needing R.utils
-fread_any <- function(path, ...) {
-  if (grepl("\\.gz$", path)) fread(cmd = paste("gzip -dc", shQuote(path)), ...) else fread(path, ...)
-}
-
-## ---- Sequence helpers -------------------------------------------------------
-
-revcomp <- function(x) stri_reverse(chartr("ACGTNacgtn", "TGCANtgcan", x))
-
-read_fasta <- function(path) {
-  l <- readLines(path, warn = FALSE)
-  l <- l[nzchar(l)]
-  h <- stri_startswith_fixed(l, ">")
-  grp <- cumsum(h)
-  ids <- stri_extract_first_regex(stri_sub(l[h], 2), "^\\S+")
-  seqs <- vapply(split(l[!h], grp[!h]), paste, "", collapse = "")
-  data.table(id = ids[as.integer(names(seqs))], seq = toupper(unname(seqs)))
-}
-
-write_fasta <- function(ids, seqs, path) {
-  writeLines(paste0(">", ids, "\n", seqs), path)
-}
-
-## ---- Family assignment ------------------------------------------------------
-
-family_of_class <- function(rclass) {
-  fifelse(stri_detect_regex(rclass, "^SINE/Alu", case_insensitive = TRUE), "Alu",
-  fifelse(stri_detect_regex(rclass, "^LINE/L1", case_insensitive = TRUE), "L1",
-  fifelse(stri_detect_regex(rclass, "(^|/)SVA", case_insensitive = TRUE), "SVA", NA_character_)))
-}
-
-TAIL_REPEAT_RE <- "^\\((A|AA[A-Z]?|A{1,3}[CGT]?|T|TT[A-Z]?|T{1,3}[ACG]?)\\)n$|^[AT]-rich$"
-SVA_HEXAMER_RE <- "^\\((CCCTCT|CCTCTC|CTCTCC|TCTCCC|CTCCCT|TCCCTC|AGAGGG|GAGGGA|AGGGAG|GGGAGA|GGAGAG|GAGAGG)\\)n$"
-
-## ---- RepeatMasker line parsing ----------------------------------------------
-
-## lines: character vector of RepeatMasker .out lines; ids: matching insertion id
-parse_rm_lines <- function(lines, ids) {
-  lines <- stri_trim_both(stri_replace_all_fixed(lines, "*", " "))
-  tok <- stri_split_regex(lines, "\\s+")
-  ok <- lengths(tok) >= 14
-  tok <- tok[ok]; ids <- ids[ok]
-  if (!length(tok)) {
-    return(data.table(id = character(), qbeg = integer(), qend = integer(), strand = character(),
-                      name = character(), rclass = character(), cbeg = integer(), cend = integer(),
-                      cleft = integer(), div = numeric()))
-  }
-  m <- do.call(rbind, lapply(tok, `[`, 1:14))
-  unparen <- function(x) suppressWarnings(as.integer(stri_replace_all_regex(x, "[()]", "")))
-  plus <- m[, 9] == "+"
-  dt <- data.table(
-    id = ids, div = suppressWarnings(as.numeric(m[, 2])),
-    qbeg = as.integer(m[, 6]), qend = as.integer(m[, 7]),
-    strand = fifelse(plus, "+", "C"), name = m[, 10], rclass = m[, 11],
-    c12 = unparen(m[, 12]), c13 = unparen(m[, 13]), c14 = unparen(m[, 14])
-  )
-  dt[, `:=`(cbeg = fifelse(plus, c12, c14), cend = fifelse(plus, c13, c13),
-            cleft = fifelse(plus, c14, c12))]
-  dt[, c("c12", "c13", "c14") := NULL]
-  dt[, `:=`(lo = pmin(cbeg, cend), hi = pmax(cbeg, cend))][, `:=`(cbeg = lo, cend = hi)][, c("lo", "hi") := NULL]
-  dt[!is.na(qbeg) & !is.na(qend) & qend >= qbeg & !is.na(cbeg)]
-}
-
-## Element_Hits cells -> long hits table
-parse_hits_field <- function(cells, ids) {
-  cells[is.na(cells) | cells %in% c("", "NONE", "nan", "NA")] <- ""
-  lst <- stri_extract_all_regex(cells, "'[^']*'|\"[^\"]*\"")
-  n <- lengths(lst)
-  n[vapply(lst, function(x) length(x) == 1 && is.na(x[1]), TRUE)] <- 0L
-  lines <- stri_sub(unlist(lst[n > 0]), 2, -2)
-  parse_rm_lines(lines, rep(ids, n))
-}
-
-first_col <- function(cols, ...) {
-  for (n in c(...)) {
-    hit <- cols[tolower(cols) == tolower(n)]
-    if (length(hit)) return(hit[1])
-  }
-  NULL
-}
-
-## L1ME-AID's ID is `chrom:POS;REF`, which two different ALT alleles at one
-## site share, so every row gets its own key (`id`) and hits are keyed on it;
-## the original ID is kept as `limeaid_id` for the allele-table join.
-## L1ME-AID v1.4 column order, used when the table has no header (shards
-## concatenated without one, as AnnotateL1MEAID's ConcatIntactMEIShards does).
-## Older versions name two of these TE_Hits / FILTER_RESULTS instead.
-LIMEAID_COLS <- c("ID", "Sequence", "Element_Hits", "Sequence_Length", "Element_Annotation",
-                  "Element_Divergence", "Element_Proportion", "Element_Percentage", "Element_Designation",
-                  "Orientation", "FLAGS", "Tail_Begins", "Tail_Type", "Tail_Length", "Tail_Seed_Hits",
-                  "Unique_Element_Count", "Twin_Priming_Flag")
-
-read_limeaid <- function(path) {
-  d <- fread_any(path, sep = "\t", quote = "", header = FALSE, fill = TRUE, colClasses = "character",
-                 showProgress = FALSE)
-  has_header <- nrow(d) > 0 && any(tolower(unlist(d[1])) == "sequence")
-  if (has_header) {
-    setnames(d, make.unique(as.character(unlist(d[1]))))
-    d <- d[-1]
-  } else {
-    n <- min(ncol(d), length(LIMEAID_COLS))
-    setnames(d, seq_len(n), LIMEAID_COLS[seq_len(n)])
-    message(path, ": no header; reading it as the L1ME-AID v1.4 column order (", ncol(d), " columns)")
-  }
-  layout <- paste0("expected L1ME-AID output, either with a header or headerless in the v1.4 order: ",
-                   paste(LIMEAID_COLS, collapse = ", "))
-  cols <- names(d)
-  c_id <- first_col(cols, "ID"); if (is.null(c_id)) c_id <- cols[1]
-  c_seq <- first_col(cols, "Sequence")
-  c_hits <- first_col(cols, "Element_Hits", "TE_Hits")
-  if (is.null(c_seq) || is.null(c_hits)) stop(path, ": no Sequence / Element_Hits columns; ", layout)
-  ## Positions are only an assumption without a header, so check the content.
-  s <- head(d[[c_seq]], 2000)
-  h <- head(d[[c_hits]], 2000)
-  seq_ok <- mean(stri_detect_regex(s, "^[ACGTNacgtn]+$"))
-  hits_ok <- mean(stri_detect_regex(h, "^\\s*\\[") | h %in% c("", "NONE", "nan", "NA", "[]"))
-  if (seq_ok < 0.95 || hits_ok < 0.95) {
-    stop(sprintf("%s: column '%s' is %.0f%% DNA and column '%s' is %.0f%% RepeatMasker hit lists (need >= 95%% each); %s",
-                 path, c_seq, 100 * seq_ok, c_hits, 100 * hits_ok, layout))
-  }
-  c_ann <- first_col(cols, "Element_Annotation")
-  c_flag <- first_col(cols, "FLAGS", "FILTER_RESULTS")
-  flag <- if (!is.null(c_flag)) d[[c_flag]] else NA_character_
-  intact <- stri_detect_regex(flag, "^(INTACT|soloLTR|ERV)")
-  key <- paste0("row", seq_len(nrow(d)))
-  ins <- data.table(
-    id = key, limeaid_id = d[[c_id]], seq = toupper(d[[c_seq]]),
-    subfamily = if (!is.null(c_ann)) d[[c_ann]] else NA_character_,
-    limeaid_flags = fifelse(intact %in% TRUE, NA_character_, flag),
-    intact_flag = fifelse(intact %in% TRUE, flag, NA_character_)
-  )
-  hits <- parse_hits_field(d[[c_hits]], key)
-  list(ins = ins, hits = hits)
-}
-
-## One table holding every family; the family is assigned after the
-## allele-table join (assign_family).
-load_insertions <- function(path) {
-  d <- read_limeaid(path)
-  d$hits[, fam_class := family_of_class(rclass)]
-  d$ins[, L := nchar(seq)]
-  d
-}
-
-family_of_type <- function(x) {
-  fifelse(stri_detect_regex(x, "alu", case_insensitive = TRUE), "Alu",
-  fifelse(stri_detect_regex(x, "line|l1", case_insensitive = TRUE), "L1",
-  fifelse(stri_detect_regex(x, "sva", case_insensitive = TRUE), "SVA", NA_character_)))
-}
-
-## Family from the allele table's MEI_type, else the RepeatMasker family with
-## the most bp in the sequence; sequences with neither are dropped. A blank
-## L1ME-AID subfamily is filled from the longest same-family hit.
-assign_family <- function(ins, hits) {
-  ins[, family := family_of_type(MEI_type)]
-  n_type <- ins[!is.na(family), .N]
-  dom <- hits[!is.na(fam_class), .(bp = sum(qend - qbeg + 1L)), by = .(id, fam_class)][order(id, -bp)][
-    , .SD[1], by = id]
-  ins[dom, on = "id", family := fifelse(is.na(family), i.fam_class, family)]
-  n_none <- ins[is.na(family), .N]
-  message(sprintf("family: %d from MEI_type, %d from RepeatMasker hits, %d with neither (dropped).",
-                  n_type, nrow(ins) - n_type - n_none, n_none))
-  ins <- ins[!is.na(family)]
-  top <- hits[ins[, .(id, family)], on = "id", nomatch = 0][fam_class == family][
-    order(-(qend - qbeg)), .SD[1], by = id][, .(id, top = name)]
-  ins[top, on = "id", subfamily := fifelse(is.na(subfamily) | subfamily %in% c("", "NONE", "nan"), i.top, subfamily)]
-  ins
-}
-
-## Clustered MEI allele table (the `*.clustered.bed` lineage: one row per
-## distinct ALT allele at a site, `cluster_id`/`var_id` grouping alleles into
-## one insertion). Joined to L1ME-AID rows on chrom + POS + md5(ALT), because
-## L1ME-AID IDs are `chrom:POS;REF` and its Sequence is the VCF ALT; md5 alone
-## collides across sites (identical full-length alleles recur genome-wide).
-MEI_TABLE_COLS <- c("chrom", "start", "end", "REF", "ALT", "MEI_type", "MEI_subfamily", "length",
-                    "orientation", "intact_status", "cluster_id", "var_id", "ALT_md5")
-
-read_mei_table <- function(path) {
-  d <- fread_any(path, sep = "\t", colClasses = "character", showProgress = FALSE)
-  if (!all(c("chrom", "start") %in% names(d))) {
-    if (ncol(d) != length(MEI_TABLE_COLS)) {
-      stop(path, ": no header and ", ncol(d), " columns; expected a header or the ",
-           length(MEI_TABLE_COLS), " columns ", paste(MEI_TABLE_COLS, collapse = ", "))
-    }
-    d <- fread_any(path, sep = "\t", colClasses = "character", header = FALSE, showProgress = FALSE)
-    setnames(d, MEI_TABLE_COLS)
-  }
-  d
-}
-
-attach_mei_table <- function(ins, path, variant_col = "var_id") {
-  m <- read_mei_table(path)
-  if (!variant_col %in% names(m)) stop("mei_table has no '", variant_col, "' column (mei_variant_col)")
-  m[, md5 := if ("ALT" %in% names(m)) as.character(openssl::md5(toupper(ALT))) else tolower(ALT_md5)]
-  ## The table's own ALT_md5 (md5 of the ALT as written) is what genotype tables are keyed on
-  m[, ALT_md5 := if ("ALT_md5" %in% names(m)) tolower(ALT_md5) else md5]
-  m[, pos := as.integer(start)]
-  if (!"MEI_type" %in% names(m)) m[, MEI_type := NA_character_]
-  m[, variant_id := if (variant_col == "cluster_id") paste(MEI_type, cluster_id, sep = "_cl") else get(variant_col)]
-  key <- unique(m[, .(chrom, pos, md5, variant_id, ALT_md5, MEI_type)])
-  n_conflict <- key[, uniqueN(variant_id), by = .(chrom, pos, md5)][V1 > 1, .N]
-  key <- key[, .SD[1], by = .(chrom, pos, md5)]
-
-  loc <- stri_match_first_regex(ins$limeaid_id, "^(.+?):(\\d+)(?:;|$)")
-  ins[, `:=`(chrom = loc[, 2], id_pos = as.integer(loc[, 3]), md5 = as.character(openssl::md5(seq)))]
-  if (all(is.na(ins$id_pos))) stop("L1ME-AID IDs are not chrom:POS[;REF] (e.g. ", ins$limeaid_id[1], "); cannot join mei_table")
-  ## Table start is VCF POS in cluster_mei_gt.R; also try 0-based BED starts.
-  hits_by_off <- vapply(c(0L, -1L), function(o)
-    nrow(key[ins[, .(chrom, pos = id_pos + o, md5)], on = .(chrom, pos, md5), nomatch = 0]), 1L)
-  off <- c(0L, -1L)[which.max(hits_by_off)]
-  ins[, pos := id_pos + off]
-  ins <- key[ins, on = .(chrom, pos, md5)]
-
-  funnel <- ins[, .(l1meaid_rows = .N, matched = sum(!is.na(variant_id)),
-                    variants = uniqueN(variant_id[!is.na(variant_id)]))]
-  cat(sprintf("mei_table: %d allele rows, %d variants; joined with start = POS%s.\n",
-              nrow(m), uniqueN(m$variant_id), if (off) " - 1" else ""))
-  if (n_conflict) cat(sprintf("mei_table: %d alleles map to more than one variant; kept the first.\n", n_conflict))
-  print(knitr::kable(funnel, caption = "L1ME-AID rows matched to mei_table (unmatched rows are dropped)"))
-  if (!any(!is.na(ins$variant_id))) stop("No L1ME-AID row matched mei_table on chrom + POS + md5(ALT)")
-  ins <- ins[!is.na(variant_id)]
-  ins[, `:=`(id_pos = NULL, md5 = NULL)]
-  ins
-}
-
-## Per-individual genotype table (CHROM, POS, ALT_md5, indiv, GT, hap1, hap2,
-## ...), one row per (allele, individual), keyed like the clustered allele
-## table (POS = its `start`). hap1/hap2 say which haplotypes carry the allele;
-## GT is used only where they are missing.
-read_genotypes <- function(path) {
-  g <- fread_any(path, sep = "\t", colClasses = "character", showProgress = FALSE)
-  need <- c("CHROM", "POS", "ALT_md5", "indiv")
-  if (!all(need %in% names(g))) stop(path, ": genotype table needs columns ", paste(need, collapse = ", "))
-  as_hap <- function(x) {
-    x <- toupper(stri_trim_both(x))
-    fifelse(x %in% c("TRUE", "T", "1"), TRUE, fifelse(x %in% c("FALSE", "F", "0"), FALSE, NA))
-  }
-  h1 <- if ("hap1" %in% names(g)) as_hap(g$hap1) else rep(NA, nrow(g))
-  h2 <- if ("hap2" %in% names(g)) as_hap(g$hap2) else rep(NA, nrow(g))
-  gt <- if ("GT" %in% names(g)) stri_split_regex(g$GT, "[/|]", simplify = TRUE) else matrix(NA_character_, nrow(g), 2)
-  h1[is.na(h1)] <- (gt[is.na(h1), 1] %in% c("1"))
-  h2[is.na(h2)] <- (if (ncol(gt) > 1) gt[is.na(h2), 2] else NA_character_) %in% c("1")
-  d <- data.table(chrom = g$CHROM, pos = as.integer(g$POS), ALT_md5 = tolower(g$ALT_md5), indiv = g$indiv,
-                  hap1 = h1, hap2 = h2)
-  ## a row repeated for the same allele and individual counts once
-  d[, .(hap1 = any(hap1), hap2 = any(hap2)), by = .(chrom, pos, ALT_md5, indiv)]
-}
-
-wmedian <- function(x, w) {
-  ok <- !is.na(x) & !is.na(w) & w > 0
-  if (!any(ok)) return(NA_real_)
-  x <- x[ok]; w <- w[ok]
-  o <- order(x)
-  as.numeric(x[o][which(cumsum(w[o]) >= sum(w) / 2)[1]])
-}
-
-## ---- Orientation ------------------------------------------------------------
-
-## Re-express each insertion's family hits in element-sense coordinates (the
-## strand carrying most family bp becomes '+'); returns list(ins with
-## sense/strand columns, fam_hits, other_hits), all in sense coordinates.
-to_sense <- function(ins, hits) {
-  h <- hits[ins[, .(id, family, L)], on = "id", nomatch = 0]
-  h[, is_core := !is.na(fam_class) & fam_class == family]
-  h[, is_fam := is_core | (family == "SVA" & stri_detect_regex(name, SVA_HEXAMER_RE, case_insensitive = TRUE))]
-  cov <- h[is_core == TRUE, .(bp = sum(qend - qbeg + 1)), by = .(id, strand)][order(id, -bp)][, .SD[1], by = id]
-  ins[, strand := "+"]
-  ins[cov, on = "id", strand := fifelse(i.strand == "+", "+", "-")]
-  minus <- ins[strand == "-", id]
-  ins[, sense := seq]
-  ins[strand == "-", sense := revcomp(seq)]
-  h[id %in% minus, `:=`(qbeg = L - qend + 1L, qend = L - qbeg + 1L, strand = fifelse(strand == "+", "C", "+"))]
-  h[, qlen := qend - qbeg + 1L]
-  list(ins = ins, fam = h[is_fam == TRUE], other = h[is_fam == FALSE])
-}
+## ---- Arguments -----------------------------------------------------------------
 
 ARGS <- list(
   limeaid_table = c("", "Required. L1ME-AID/INTACT_MEI TSV covering every family"),
@@ -353,6 +50,8 @@ ARGS <- list(
   max_5p_missing = c("Alu=20,L1=50,SVA=50", "Consensus bp missing at the 5' end before calling 5' truncation, per family"),
   max_3p_missing = c("Alu=20,L1=50,SVA=50", "Consensus bp missing at the 3' end before calling 3' truncation, per family"),
   min_transduction = c("30", "Minimum unique bp for a transduction"),
+  f1_min_mast2_bp = c("60", "MAST2 exon 1 bp in front of an SVA that make it SVA_F1 (MAST2 then counts as element, not 5' transduction)"),
+  sva_hexamer_cons_bp = c("80", "SVA consensus bp covered by its leading hexamer: an SVA hit starting within it, with hexamer directly in front, is not 5' truncated"),
   max_transduction_masked = c("0.5", "Maximum repeat-masked fraction of a transduced segment"),
   min_orphan = c("100", "Minimum unique bp for an orphan-transduction candidate"),
   min_polya = c("8", "Minimum poly(A) length"),
@@ -389,50 +88,72 @@ ARGS <- list(
   outdir = c(".", "Output directory"),
   prefix = c("mei", "Output file prefix")
 )
-ap <- arg_parser("Catalog MEI structural forms and trace transduction sources")
-for (n in names(ARGS)) ap <- add_argument(ap, paste0("--", gsub("_", "-", n)), help = ARGS[[n]][2], default = ARGS[[n]][1])
-argv <- parse_args(ap)
-params <- setNames(lapply(names(ARGS), function(n) {
-  v <- argv[[n]]
-  if (is.null(v) || (length(v) == 1 && is.na(v))) "" else as.character(v)
+parser <- arg_parser("Catalog MEI structural forms and trace transduction sources")
+for (name in names(ARGS)) {
+  parser <- add_argument(parser, paste0("--", gsub("_", "-", name)), help = ARGS[[name]][2], default = ARGS[[name]][1])
+}
+argv <- parse_args(parser)
+## argparser hands every option over as a string; "" means unset
+params <- setNames(lapply(names(ARGS), function(name) {
+  value <- argv[[name]]
+  if (is.null(value) || (length(value) == 1 && is.na(value))) "" else as.character(value)
 }), names(ARGS))
+for (required in c("limeaid_table", "mei_table", "genotype_table")) {
+  if (!nzchar(params[[required]])) stop("--", gsub("_", "-", required), " is required")
+}
+
+## "Alu=20,L1=50" -> c(Alu = 20L, L1 = 50L)
+per_family <- function(x) {
+  pairs <- stri_split_fixed(stri_split_fixed(x, ",")[[1]], "=", n = 2)
+  setNames(as.integer(stri_trim_both(map_chr(pairs, 2))), stri_trim_both(map_chr(pairs, 1)))
+}
+opt <- list(
+  max_5p_missing = per_family(params$max_5p_missing),
+  max_3p_missing = per_family(params$max_3p_missing),
+  min_transduction = as.integer(params$min_transduction),
+  max_transduction_masked = as.numeric(params$max_transduction_masked),
+  min_orphan = as.integer(params$min_orphan),
+  min_polya = as.integer(params$min_polya),
+  polya_min_frac = as.numeric(params$polya_min_frac),
+  polya_gap = as.integer(params$polya_gap),
+  terminal_slack = as.integer(params$terminal_slack),
+  min_inversion = as.integer(params$min_inversion),
+  inv_slack = as.integer(params$inv_slack),
+  min_internal_gap = as.integer(params$min_internal_gap),
+  min_segment = as.integer(params$min_segment),
+  sva_hexamer_cons_bp = as.integer(params$sva_hexamer_cons_bp),
+  f1_min_mast2_bp = as.integer(params$f1_min_mast2_bp),
+  min_mapq = as.integer(params$min_mapq),
+  min_identity = as.numeric(params$min_identity),
+  min_qcov = as.numeric(params$min_qcov),
+  self_window = as.integer(params$self_window),
+  source_window = as.integer(params$source_window),
+  overlap_tolerance = as.integer(params$overlap_tolerance),
+  cluster_window = as.integer(params$cluster_window),
+  full_length_l1_bp = as.integer(params$full_length_l1_bp),
+  repeat_max_div = as.numeric(params$repeat_max_div),
+  run_ava = as.logical(params$run_ava) %in% TRUE,
+  flank_search = as.logical(params$flank_search) %in% TRUE
+)
 
 dir.create(params$outdir, showWarnings = FALSE, recursive = TRUE)
-tab_path <- function(name, ext = "tsv") file.path(params$outdir, paste0(params$prefix, ".structure_", name, ".", ext))
-save_tab <- function(d, name, ext = "tsv") {
-  f <- tab_path(name, ext)
-  fwrite(d, f, sep = "\t", na = "NA")
-  message("wrote ", f, " (", nrow(d), " rows)")
-}
-LOG <- function(...) message(sprintf(...))
+out_file <- function(name) file.path(params$outdir, paste0(params$prefix, ".structure_", name))
 
-P <- list(
-  max5 = lapply(p_map(params$max_5p_missing), as.integer),
-  max3 = lapply(p_map(params$max_3p_missing), as.integer),
-  min_td = p_int(params$min_transduction), max_td_masked = p_num(params$max_transduction_masked),
-  min_orphan = p_int(params$min_orphan), min_polya = p_int(params$min_polya),
-  polya_frac = p_num(params$polya_min_frac), polya_gap = p_int(params$polya_gap),
-  slack = p_int(params$terminal_slack), min_inv = p_int(params$min_inversion),
-  inv_slack = p_int(params$inv_slack), min_gap = p_int(params$min_internal_gap),
-  min_seg = p_int(params$min_segment)
-)
-for (req in c("limeaid_table", "mei_table", "genotype_table")) {
-  if (is.null(p_str(params[[req]]))) stop("--", gsub("_", "-", req), " is required")
-}
-run_sources <- !is.null(p_str(params$reference)) || !is.null(p_str(params$transduction_paf))
-
+## ---- Startup checks -------------------------------------------------------------
 ## The genome pass leaves short and low-MAPQ pieces to the source-flank search,
 ## so a run without it loses many correct sources: fail before the slow part.
-ref_fa <- p_str(params$reference_fasta)
-if (is.null(ref_fa) && !is.null(p_str(params$reference)) && !grepl("\\.mmi$", params$reference)) ref_fa <- params$reference
-if (run_sources && p_bool(params$flank_search)) {
+
+run_sources <- nzchar(params$reference) || nzchar(params$transduction_paf)
+reference_fasta <- if (nzchar(params$reference_fasta)) params$reference_fasta else
+  if (nzchar(params$reference) && !grepl("\\.mmi$", params$reference)) params$reference else ""
+if (run_sources && opt$flank_search) {
   problems <- c(
-    if (is.null(ref_fa)) "no reference FASTA: --reference is a .mmi or absent (only --transduction-paf); pass --reference-fasta",
-    if (!is.null(ref_fa) && !file.exists(ref_fa)) sprintf("reference FASTA %s does not exist", ref_fa),
-    if (is.null(p_str(params$ref_rmsk))) "no --ref-rmsk: without it the flank library and hits cannot be repeat-masked",
-    if (is.null(which_tool("samtools"))) "samtools not on PATH",
-    if (is.null(which_tool("makeblastdb"))) "makeblastdb not on PATH",
-    if (is.null(which_tool("blastn"))) "blastn not on PATH")
+    if (!nzchar(reference_fasta)) "no reference FASTA: --reference is a .mmi or absent (only --transduction-paf); pass --reference-fasta",
+    if (nzchar(reference_fasta) && !file.exists(reference_fasta)) sprintf("reference FASTA %s does not exist", reference_fasta),
+    if (!nzchar(params$ref_rmsk)) "no --ref-rmsk: without it the flank library and hits cannot be repeat-masked",
+    if (!nzchar(Sys.which("samtools"))) "samtools not on PATH",
+    if (!nzchar(Sys.which("makeblastdb"))) "makeblastdb not on PATH",
+    if (!nzchar(Sys.which("blastn"))) "blastn not on PATH")
   if (length(problems)) stop("source-flank search cannot run:\n  - ", paste(problems, collapse = "\n  - "),
                              "\nFix these, or pass --flank-search false to accept that short and low-MAPQ transduction pieces stay untraced.")
 } else if (run_sources) {
@@ -440,298 +161,728 @@ if (run_sources && p_bool(params$flank_search)) {
           "untraced (ambiguous_source / unaligned); in simulation 50 bp recall fell from ~92% to ~61%.\n", strrep("!", 78))
 }
 
-## ---- Load -------------------------------------------------------------------
+## ---- L1ME-AID table: insertions and their RepeatMasker hits ----------------------
+## L1ME-AID's ID is `chrom:POS;REF`, which two different ALT alleles at one site
+## share, so every row gets its own key (`id`) and hits are keyed on it; the
+## original ID is kept as `limeaid_id` for the allele-table join. A headerless
+## table (shards concatenated without one, as AnnotateL1MEAID's
+## ConcatIntactMEIShards does) is read in the L1ME-AID v1.4 column order. Older
+## versions name two of these TE_Hits / FILTER_RESULTS instead.
 
-dat <- load_insertions(params$limeaid_table)
-hits <- dat$hits
-ins <- attach_mei_table(dat$ins, params$mei_table, params$mei_variant_col)
-ins <- assign_family(ins, hits)
-for (f in unique(ins$family)) {
-  if (is.null(P$max5[[f]])) P$max5[[f]] <- 50L
-  if (is.null(P$max3[[f]])) P$max3[[f]] <- 50L
+LIMEAID_COLS <- c("ID", "Sequence", "Element_Hits", "Sequence_Length", "Element_Annotation",
+                  "Element_Divergence", "Element_Proportion", "Element_Percentage", "Element_Designation",
+                  "Orientation", "FLAGS", "Tail_Begins", "Tail_Type", "Tail_Length", "Tail_Seed_Hits",
+                  "Unique_Element_Count", "Twin_Priming_Flag")
+limeaid <- read_tsv(params$limeaid_table, col_names = FALSE, col_types = cols(.default = col_character()),
+                    quote = "", na = "NA", progress = FALSE)
+if (nrow(limeaid) > 0 && any(tolower(unlist(limeaid[1, ])) == "sequence")) {
+  names(limeaid) <- make.unique(as.character(unlist(limeaid[1, ])))
+  limeaid <- limeaid[-1, ]
+} else {
+  n_named <- min(ncol(limeaid), length(LIMEAID_COLS))
+  names(limeaid)[seq_len(n_named)] <- LIMEAID_COLS[seq_len(n_named)]
+  message(params$limeaid_table, ": no header; reading it as the L1ME-AID v1.4 column order (", ncol(limeaid), " columns)")
 }
+layout <- paste0("expected L1ME-AID output, either with a header or headerless in the v1.4 order: ",
+                 paste(LIMEAID_COLS, collapse = ", "))
+column_named <- function(...) {
+  for (candidate in c(...)) {
+    found <- names(limeaid)[tolower(names(limeaid)) == tolower(candidate)]
+    if (length(found)) return(found[1])
+  }
+  NULL
+}
+id_col <- column_named("ID") %||% names(limeaid)[1]
+seq_col <- column_named("Sequence")
+hits_col <- column_named("Element_Hits", "TE_Hits")
+if (is.null(seq_col) || is.null(hits_col)) stop(params$limeaid_table, ": no Sequence / Element_Hits columns; ", layout)
+## Positions are only an assumption without a header, so check the content.
+seq_ok <- mean(stri_detect_regex(head(limeaid[[seq_col]], 2000), "^[ACGTNacgtn]+$"))
+hits_ok <- mean(stri_detect_regex(head(limeaid[[hits_col]], 2000), "^\\s*\\[") |
+                  head(limeaid[[hits_col]], 2000) %in% c("", "NONE", "nan", "NA", "[]"))
+if (seq_ok < 0.95 || hits_ok < 0.95) {
+  stop(sprintf("%s: column '%s' is %.0f%% DNA and column '%s' is %.0f%% RepeatMasker hit lists (need >= 95%% each); %s",
+               params$limeaid_table, seq_col, 100 * seq_ok, hits_col, 100 * hits_ok, layout))
+}
+annotation_col <- column_named("Element_Annotation")
+flag_col <- column_named("FLAGS", "FILTER_RESULTS")
+flags <- if (!is.null(flag_col)) limeaid[[flag_col]] else NA_character_
+is_intact_flag <- stri_detect_regex(flags, "^(INTACT|soloLTR|ERV)") %in% TRUE
+insertions <- tibble(
+  id = paste0("row", seq_len(nrow(limeaid))),
+  limeaid_id = limeaid[[id_col]],
+  seq = toupper(limeaid[[seq_col]]),
+  subfamily = if (!is.null(annotation_col)) limeaid[[annotation_col]] else NA_character_,
+  limeaid_flags = if_else(is_intact_flag, NA_character_, flags),
+  intact_flag = if_else(is_intact_flag, flags, NA_character_)
+) %>%
+  mutate(L = nchar(seq))
+
+## Each Element_Hits cell is a Python-list repr of RepeatMasker .out lines.
+## RepeatMasker coordinates are 1-based inclusive; on 'C'-strand hits the
+## consensus columns are "(left) end begin", so they are re-ordered and
+## cons_begin <= cons_end always holds.
+hit_cells <- limeaid[[hits_col]]
+hit_cells[is.na(hit_cells) | hit_cells %in% c("", "NONE", "nan", "NA")] <- ""
+quoted <- stri_extract_all_regex(hit_cells, "'[^']*'|\"[^\"]*\"")
+n_lines <- lengths(quoted)
+n_lines[map_lgl(quoted, ~ length(.x) == 1 && is.na(.x[1]))] <- 0L
+rm_lines <- stri_trim_both(stri_replace_all_fixed(stri_sub(unlist(quoted[n_lines > 0]), 2, -2), "*", " "))
+tokens <- stri_split_regex(rm_lines, "\\s+")
+has_fields <- lengths(tokens) >= 14
+fields <- do.call(rbind, lapply(tokens[has_fields], `[`, 1:14))
+if (is.null(fields)) fields <- matrix(character(), 0, 14)
+unparen <- function(x) suppressWarnings(as.integer(stri_replace_all_regex(x, "[()]", "")))
+on_plus <- fields[, 9] == "+"
+rm_hits <- tibble(
+  id = rep(insertions$id, n_lines)[has_fields],
+  divergence = suppressWarnings(as.numeric(fields[, 2])),
+  query_start = as.integer(fields[, 6]), query_end = as.integer(fields[, 7]),
+  strand = if_else(on_plus, "+", "C"), repeat_name = fields[, 10], repeat_class = fields[, 11],
+  col12 = unparen(fields[, 12]), col13 = unparen(fields[, 13]), col14 = unparen(fields[, 14])
+) %>%
+  mutate(cons_begin = if_else(on_plus, col12, col14),
+         cons_end = col13,
+         cons_left = if_else(on_plus, col14, col12),
+         lo = pmin(cons_begin, cons_end), hi = pmax(cons_begin, cons_end),
+         cons_begin = lo, cons_end = hi) %>%
+  select(-col12, -col13, -col14, -lo, -hi) %>%
+  filter(!is.na(query_start), !is.na(query_end), query_end >= query_start, !is.na(cons_begin)) %>%
+  mutate(rm_family = case_when(stri_detect_regex(repeat_class, "^SINE/Alu", case_insensitive = TRUE) ~ "Alu",
+                               stri_detect_regex(repeat_class, "^LINE/L1", case_insensitive = TRUE) ~ "L1",
+                               stri_detect_regex(repeat_class, "(^|/)SVA", case_insensitive = TRUE) ~ "SVA",
+                               TRUE ~ NA_character_))
+
+## ---- MEI allele table: variant and family of each sequence -------------------------
+## The `*.clustered.bed` lineage: one row per distinct ALT allele at a site,
+## `cluster_id`/`var_id` grouping alleles into one insertion. Joined to
+## L1ME-AID rows on chrom + POS + md5(ALT), because L1ME-AID IDs are
+## `chrom:POS;REF` and its Sequence is the VCF ALT; md5 alone collides across
+## sites (identical full-length alleles recur genome-wide). The table's own
+## ALT_md5 (md5 of the ALT as written) is what genotype tables are keyed on.
+
+MEI_TABLE_COLS <- c("chrom", "start", "end", "REF", "ALT", "MEI_type", "MEI_subfamily", "length",
+                    "orientation", "intact_status", "cluster_id", "var_id", "ALT_md5")
+mei_table <- read_tsv(params$mei_table, col_types = cols(.default = col_character()), na = "NA", progress = FALSE)
+if (!all(c("chrom", "start") %in% names(mei_table))) {
+  if (ncol(mei_table) != length(MEI_TABLE_COLS)) {
+    stop(params$mei_table, ": no header and ", ncol(mei_table), " columns; expected a header or the ",
+         length(MEI_TABLE_COLS), " columns ", paste(MEI_TABLE_COLS, collapse = ", "))
+  }
+  mei_table <- read_tsv(params$mei_table, col_names = MEI_TABLE_COLS, col_types = cols(.default = col_character()),
+                        na = "NA", progress = FALSE)
+}
+variant_col <- params$mei_variant_col
+if (!variant_col %in% names(mei_table)) stop("mei_table has no '", variant_col, "' column (mei_variant_col)")
+if (!"MEI_type" %in% names(mei_table)) mei_table$MEI_type <- NA_character_
+mei_table <- mei_table %>%
+  mutate(md5 = if ("ALT" %in% names(.)) as.character(openssl::md5(toupper(ALT))) else tolower(ALT_md5),
+         ALT_md5 = if ("ALT_md5" %in% names(.)) tolower(ALT_md5) else md5,
+         pos = as.integer(start),
+         variant_id = if (variant_col == "cluster_id") paste(MEI_type, cluster_id, sep = "_cl") else .data[[variant_col]])
+allele_keys <- mei_table %>% distinct(chrom, pos, md5, variant_id, ALT_md5, MEI_type)
+n_conflict <- allele_keys %>% group_by(chrom, pos, md5) %>% filter(n_distinct(variant_id) > 1) %>% n_groups()
+allele_keys <- allele_keys %>% distinct(chrom, pos, md5, .keep_all = TRUE)
+
+id_location <- stri_match_first_regex(insertions$limeaid_id, "^(.+?):(\\d+)(?:;|$)")
+insertions <- insertions %>%
+  mutate(chrom = id_location[, 2], id_pos = as.integer(id_location[, 3]), md5 = as.character(openssl::md5(seq)))
+if (all(is.na(insertions$id_pos))) {
+  stop("L1ME-AID IDs are not chrom:POS[;REF] (e.g. ", insertions$limeaid_id[1], "); cannot join mei_table")
+}
+## Table start is VCF POS in cluster_mei_gt.R; also try 0-based BED starts.
+matches_by_offset <- map_int(c(0L, -1L), function(offset)
+  nrow(inner_join(insertions %>% transmute(chrom, pos = id_pos + offset, md5), allele_keys, by = c("chrom", "pos", "md5"))))
+pos_offset <- c(0L, -1L)[which.max(matches_by_offset)]
+insertions <- insertions %>%
+  mutate(pos = id_pos + pos_offset) %>%
+  left_join(allele_keys, by = c("chrom", "pos", "md5"))
+cat(sprintf("mei_table: %d allele rows, %d variants; joined with start = POS%s.\n",
+            nrow(mei_table), n_distinct(mei_table$variant_id), if (pos_offset) " - 1" else ""))
+if (n_conflict) cat(sprintf("mei_table: %d alleles map to more than one variant; kept the first.\n", n_conflict))
+print(knitr::kable(insertions %>% summarise(l1meaid_rows = n(), matched = sum(!is.na(variant_id)),
+                                            variants = n_distinct(variant_id[!is.na(variant_id)])),
+                   caption = "L1ME-AID rows matched to mei_table (unmatched rows are dropped)"))
+if (!any(!is.na(insertions$variant_id))) stop("No L1ME-AID row matched mei_table on chrom + POS + md5(ALT)")
+insertions <- insertions %>% filter(!is.na(variant_id)) %>% select(-id_pos, -md5)
+
+## Family from the allele table's MEI_type, else the RepeatMasker family with
+## the most bp in the sequence; sequences with neither are dropped. A blank
+## L1ME-AID subfamily is filled from the longest same-family hit.
+dominant_family <- rm_hits %>%
+  filter(!is.na(rm_family)) %>%
+  mutate(seen = row_number()) %>%
+  group_by(id, rm_family) %>%
+  summarise(bp = sum(query_end - query_start + 1L), seen = min(seen), .groups = "drop") %>%
+  arrange(id, desc(bp), seen) %>%
+  distinct(id, .keep_all = TRUE)
+insertions <- insertions %>%
+  mutate(family = case_when(stri_detect_regex(MEI_type, "alu", case_insensitive = TRUE) ~ "Alu",
+                            stri_detect_regex(MEI_type, "line|l1", case_insensitive = TRUE) ~ "L1",
+                            stri_detect_regex(MEI_type, "sva", case_insensitive = TRUE) ~ "SVA",
+                            TRUE ~ NA_character_))
+n_from_type <- sum(!is.na(insertions$family))
+insertions <- insertions %>%
+  left_join(dominant_family %>% select(id, rm_family), by = "id") %>%
+  mutate(family = coalesce(family, rm_family)) %>%
+  select(-rm_family)
+n_without <- sum(is.na(insertions$family))
+message(sprintf("family: %d from MEI_type, %d from RepeatMasker hits, %d with neither (dropped).",
+                n_from_type, nrow(insertions) - n_from_type - n_without, n_without))
+insertions <- insertions %>% filter(!is.na(family))
+longest_family_hit <- rm_hits %>%
+  inner_join(insertions %>% select(id, family), by = "id") %>%
+  filter(rm_family == family) %>%
+  arrange(desc(query_end - query_start)) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  select(id, longest_hit = repeat_name)
+insertions <- insertions %>%
+  left_join(longest_family_hit, by = "id") %>%
+  mutate(subfamily = if_else(is.na(subfamily) | subfamily %in% c("", "NONE", "nan"), longest_hit, subfamily)) %>%
+  select(-longest_hit)
+max_5p_missing <- opt$max_5p_missing
+max_3p_missing <- opt$max_3p_missing
+for (fam in setdiff(unique(insertions$family), names(max_5p_missing))) max_5p_missing[fam] <- 50L
+for (fam in setdiff(unique(insertions$family), names(max_3p_missing))) max_3p_missing[fam] <- 50L
+
 ## Identical (family, sequence, hits) inputs give identical calls: classify
-## each distinct one once. Hit signature excludes the query name.
-sig <- hits[, .(sig = paste(qbeg, qend, strand, name, cbeg, cend, collapse = ";")), by = id]
-ins[sig, on = "id", sig := i.sig]
-ins[is.na(sig), sig := ""]
-ins[, uid := .GRP, by = .(family, seq, sig)]
-rep_ids <- ins[, .(id = id[1]), by = uid]
-LOG("Loaded %d sequences (%d distinct) across %s.", nrow(ins), nrow(rep_ids),
-    paste(sprintf("%s: %d", names(table(ins$family)), table(ins$family)), collapse = ", "))
+## each distinct one once. The hit signature leaves out the query name.
+hit_signature <- rm_hits %>%
+  group_by(id) %>%
+  summarise(sig = paste(query_start, query_end, strand, repeat_name, cons_begin, cons_end, collapse = ";"))
+insertions <- insertions %>%
+  left_join(hit_signature, by = "id") %>%
+  mutate(sig = coalesce(sig, ""),
+         key = paste(family, seq, sig, sep = "\r"),
+         uid = match(key, unique(key))) %>%
+  select(-sig, -key)
+representatives <- insertions %>% distinct(uid, .keep_all = TRUE) %>% select(uid, id)
+message(sprintf("Loaded %d sequences (%d distinct) across %s.", nrow(insertions), nrow(representatives),
+                paste(sprintf("%s: %d", names(table(insertions$family)), table(insertions$family)), collapse = ", ")))
 
-## ---- Classification ---------------------------------------------------------
+## ---- Element-sense orientation ------------------------------------------------------
+## The strand carrying most family bp becomes '+': the sequence is reverse
+## complemented and every hit re-expressed in that orientation. Family hits
+## are the family's own (core) hits plus, for SVA, (CCCTCT)n-style hexamer hits.
 
-SNRNA_RE <- "snRNA|scRNA|srpRNA|7SL|U6|U3|7SK"
+SVA_HEXAMER_RE <- "^\\((CCCTCT|CCTCTC|CTCTCC|TCTCCC|CTCCCT|TCCCTC|AGAGGG|GAGGGA|AGGGAG|GGGAGA|GGAGAG|GAGAGG)\\)n$"
+TAIL_REPEAT_RE <- "^\\((A|AA[A-Z]?|A{1,3}[CGT]?|T|TT[A-Z]?|T{1,3}[ACG]?)\\)n$|^[AT]-rich$"
+to_classify <- insertions %>% semi_join(representatives, by = "id")
+sense_hits <- rm_hits %>%
+  inner_join(to_classify %>% select(id, family, L), by = "id") %>%
+  mutate(is_core = !is.na(rm_family) & rm_family == family,
+         is_family = is_core | (family == "SVA" & stri_detect_regex(repeat_name, SVA_HEXAMER_RE, case_insensitive = TRUE)))
+majority_strand <- sense_hits %>%
+  filter(is_core) %>%
+  mutate(seen = row_number()) %>%
+  group_by(id, strand) %>%
+  summarise(bp = sum(query_end - query_start + 1), seen = min(seen), .groups = "drop") %>%
+  arrange(id, desc(bp), seen) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  transmute(id, orientation = if_else(strand == "+", "+", "-"))
+to_classify <- to_classify %>%
+  left_join(majority_strand, by = "id") %>%
+  mutate(strand = coalesce(orientation, "+"),
+         sense = if_else(strand == "-", stri_reverse(chartr("ACGTNacgtn", "TGCANtgcan", seq)), seq)) %>%
+  select(-orientation)
+minus_ids <- to_classify$id[to_classify$strand == "-"]
+sense_hits <- sense_hits %>%
+  mutate(flip = id %in% minus_ids,
+         new_start = if_else(flip, L - query_end + 1L, query_start),
+         query_end = if_else(flip, L - query_start + 1L, query_end),
+         query_start = new_start,
+         strand = if_else(flip, if_else(strand == "+", "C", "+"), strand),
+         query_len = query_end - query_start + 1L) %>%
+  select(-flip, -new_start)
+core_hits <- sense_hits %>% filter(is_family, is_core)
+sense_core <- core_hits %>% filter(strand == "+") %>% arrange(id, query_start)
+inverted_core <- core_hits %>% filter(strand == "C")
+hexamer_hits <- sense_hits %>% filter(is_family, !is_core)
+other_hits <- sense_hits %>% filter(!is_family)
+is_tail_hit <- stri_detect_regex(other_hits$repeat_name, TAIL_REPEAT_RE, case_insensitive = TRUE)
+tail_hits <- other_hits[is_tail_hit & other_hits$strand == "+", ]
+nontail_hits <- other_hits[!is_tail_hit, ]
+
+## ---- Classification: element span -------------------------------------------------
+
+calls <- to_classify %>%
+  select(id, family, subfamily, L, strand, limeaid_flags, intact_flag, sense) %>%
+  left_join(core_hits %>% group_by(id) %>% summarise(family_bp = sum(query_len)), by = "id") %>%
+  mutate(family_bp = coalesce(family_bp, 0L), family_frac = family_bp / L) %>%
+  left_join(sense_core %>% group_by(id) %>%
+              summarise(sense_start = min(query_start) - 1L, te_end = max(query_end),
+                        retained = sum(cons_end - cons_begin + 1L),
+                        divergence = sum(divergence * query_len) / sum(query_len)), by = "id") %>%
+  left_join(sense_core %>% group_by(id) %>% slice(which.min(query_start)) %>% ungroup() %>%
+              transmute(id, cons_start = cons_begin, five_hit = repeat_name, five_cend = cons_end), by = "id") %>%
+  left_join(sense_core %>% group_by(id) %>% slice(which.max(query_end)) %>% ungroup() %>%
+              transmute(id, cons_end, cons_left_3p = cons_left, cons_len = cons_end + cons_left, three_hit = repeat_name),
+            by = "id") %>%
+  left_join(bind_rows(sense_core, hexamer_hits, inverted_core) %>% group_by(id) %>%
+              summarise(te_start = min(query_start) - 1L), by = "id") %>%
+  mutate(has_main = !is.na(te_end))
+
+## RepeatMasker often leaves the outer copies of the SVA hexamer unannotated or
+## calls them CT-rich low complexity, so the element would start partway into
+## the array and the rest would be called a 5' transduction. The start is moved
+## out over any run of >= 2 hexamer motifs (gaps <= 12 bp) running into it.
+## Motifs are every rotation of the canonical CCCTCT and of the alternate units
+## of Kirby et al. 2025 (Mobile DNA 16:42, Fig. 2d); their 16/19/25-mer units
+## are hexamer copies with short insertions, which the gap tolerance covers.
+HEX_UNITS <- c("CCCTCT", "TCTACC", "CCCCCT", "GTCTCC", "CCCCTCT", "CCCCCTCT")
+hex_rotations <- unique(unlist(map(HEX_UNITS, function(unit)
+  map_chr(seq_len(nchar(unit)), ~ paste0(substring(unit, .x), substr(unit, 1, .x - 1))))))
+HEX_MOTIF_RE <- paste(hex_rotations[order(-nchar(hex_rotations))], collapse = "|")
+extend_over_hexamer <- calls$family == "SVA" & calls$has_main & calls$te_start > 0
+extend_over_hexamer[is.na(extend_over_hexamer)] <- FALSE
+extended_start <- calls$te_start
+extended_start[extend_over_hexamer] <- map2_int(calls$sense[extend_over_hexamer], calls$te_start[extend_over_hexamer],
+                                                function(sense, start) {
+  motifs <- stri_locate_all_regex(stri_sub(sense, 1L, start), HEX_MOTIF_RE, omit_no_match = TRUE)[[1]]
+  edge <- start; n_motifs <- 0L
+  for (k in rev(seq_len(nrow(motifs)))) {
+    if (edge - motifs[k, 2] > 12L) break
+    edge <- motifs[k, 1] - 1L; n_motifs <- n_motifs + 1L
+  }
+  if (n_motifs >= 2L) as.integer(edge) else start
+})
+calls <- calls %>% mutate(hexamer_extended_bp = te_start - extended_start, te_start = extended_start)
+
+## SVA_F1 carries MAST2 exon 1, transcribed from a start inside the exon and
+## spliced into the SVA Alu-like region (Kirby et al. 2025 count it as part of
+## F1, not a 5' transduction). The exon is GRCh38 chr1:45803532-45804072
+## (Ensembl MAST2 exon 1, + strand, the element-sense orientation of F1). In
+## the 2026-11 cohort F1 elements start at exon offset 178 and leave the exon at
+## 398 or 451, joining the SVA consensus at ~269 or ~392. An SVA with
+## f1_min_mast2_bp of MAST2 20-mers in front of its element start is F1; the
+## element then starts at the MAST2 start.
+MAST2_EXON1 <- paste0(
+  "GGGAGGCGGCGCGCGGCCGGAGGTGGCGGGCGGGCTCCCGGTGCGCGCGCGTGAGGGGCGGGGCCGGCCG",
+  "AAGGCTGGCTGTAGGCAGGCGGCTGAGCCGGCGGCGGGTGGCCTGCCCAACGTGTGCTGGGTGGGAGAAG",
+  "GCGAGGCGTCAGCGATGCTGTCTCTTCCGTGAGGAGCGCAGAGGAGGTCGCGGCGCCGGAGGCCCCAGAA",
+  "GGCTCGAAGGCGCCGCGGGCTGGGGTCGGTGGCTTAGGGAGCCCGTCCGGCCATGGTGGCCGCGGGTGGT",
+  "GGTTGGCGCGGCTGCGCTGCGGCCCGGGGCAGTGCGGAGCCGGGACAGTCGCGGCGCTGACGCCCGCGGG",
+  "CCCCAGCTGCAGATATGAAGCGGAGCCGCTGCCGCGACCGACCGCAGCCGCCGCCGCCCGACCGCCGGGA",
+  "GGATGGAGTTCAGCGGGCAGCGGAGCTGTCTCAGTCTTTGCCGCCGCGCCGGCGAGCGCCGCCCGGGAGG",
+  "CAGCGGCTGGAGGAGCGGACGGGCCCCGCGGGGCCCGAGGGCAAGGAGCAG")
+MAST2_F1_START <- 178L
+mast2_kmers <- stri_sub(MAST2_EXON1, seq_len(nchar(MAST2_EXON1) - 19L), length = 20L)
+f1_candidates <- calls %>%
+  filter(family == "SVA", has_main, te_start >= opt$f1_min_mast2_bp) %>%
+  select(id, sense, te_start)
+mast2_match <- map2(f1_candidates$sense, f1_candidates$te_start, function(sense, start) {
+  front <- stri_sub(sense, 1L, start)
+  n_kmers <- nchar(front) - 19L
+  at <- if (n_kmers > 0) which(stri_sub(front, seq_len(n_kmers), length = 20L) %in% mast2_kmers) else integer()
+  if (!length(at)) return(c(0L, NA_integer_, NA_integer_))
+  c(length(unique(unlist(map(at, ~ .x:(.x + 19L))))), min(at), match(stri_sub(front, min(at), length = 20L), mast2_kmers))
+})
+f1_found <- f1_candidates %>%
+  transmute(id, mast2_bp = map_int(mast2_match, 1), mast2_q_start = map_int(mast2_match, 2),
+            mast2_exon_start = map_int(mast2_match, 3)) %>%
+  filter(mast2_bp >= opt$f1_min_mast2_bp)
+calls <- calls %>%
+  mutate(subfamily_input = subfamily) %>%
+  left_join(f1_found %>% rename(f1_bp = mast2_bp, f1_q_start = mast2_q_start, f1_exon_start = mast2_exon_start), by = "id") %>%
+  mutate(sva_f1 = !is.na(f1_bp),
+         mast2_bp = coalesce(f1_bp, 0L),
+         mast2_q_start = f1_q_start,
+         mast2_exon_start = f1_exon_start,
+         te_start = if_else(sva_f1, f1_q_start - 1L, te_start),
+         subfamily = if_else(sva_f1, "SVA_F1", subfamily)) %>%
+  select(-f1_bp, -f1_q_start, -f1_exon_start)
+
+## ---- Classification: truncation, inversion, deletions (Fig. 2 b/c/e/i) ---------------
+
 SPLIT_3P_RE <- "_(3end|orf2)$"
-PAS_RE <- "AATAAA|ATTAAA|AGTAAA|TATAAA|CATAAA|GATAAA|AATATA|AATACA|AATAGA|ACTAAA|AAGAAA|AATGAA"
+## The SVA consensus starts with ~56 bp of hexamer, so when RepeatMasker gives
+## the element's hexamer to a simple-repeat hit the SVA hit starts at
+## consensus ~57 and a complete element reads as 5' truncated. Hexamer bases
+## directly in front count toward the consensus 5' end, but only while the
+## hit starts inside the consensus hexamer (sva_hexamer_cons_bp).
+calls <- calls %>%
+  mutate(max5 = unname(max_5p_missing[family]), max3 = unname(max_3p_missing[family]),
+         hex_before_bp = if_else(family == "SVA" & has_main & !sva_f1 & !id %in% inverted_core$id,
+                                 pmax(0L, sense_start - te_start), 0L),
+         five_prime_missing_rm = cons_start - 1L,
+         five_prime_missing = case_when(
+           sva_f1 ~ pmax(0L, mast2_exon_start - MAST2_F1_START),
+           (hex_before_bp >= 12L & five_prime_missing_rm <= opt$sva_hexamer_cons_bp) %in% TRUE ~ pmax(0L, five_prime_missing_rm - hex_before_bp),
+           TRUE ~ five_prime_missing_rm),
+         five_prime_truncated = has_main & (stri_detect_regex(five_hit, SPLIT_3P_RE, case_insensitive = TRUE) |
+                                              five_prime_missing > max5),
+         retained_cons_frac = pmin(1, retained / cons_len),
+         three_prime_missing = cons_left_3p,
+         three_prime_truncated = has_main & cons_left_3p > max3 & !stri_detect_regex(three_hit, "_5end$"))
 
-## Fraction of each interval [s, e) (0-based) covered by hits (qbeg..qend, 1-based).
-masked_frac <- function(iv, h) {
-  if (!nrow(iv)) return(numeric())
-  iv <- copy(iv)[, row := .I]
-  if (!nrow(h)) return(rep(0, nrow(iv)))
-  ov <- h[, .(id, qbeg, qend)][iv, on = "id", nomatch = 0, allow.cartesian = TRUE][
-    , .(ov = sum(pmax(0L, pmin(e, qend) - pmax(s, qbeg - 1L)))), by = row]
-  out <- numeric(nrow(iv))
-  out[ov$row] <- ov$ov
-  pmin(1, out / pmax(1, iv$e - iv$s))
-}
+## 5' inversion: opposite-strand family sequence 5' of the sense portion.
+## junction > 0: deletion at the inversion point, < 0: duplication (Ostertag & Kazazian 2001)
+inversions <- inverted_core %>%
+  inner_join(calls %>% filter(has_main) %>% select(id, sense_start), by = "id") %>%
+  filter(query_end <= sense_start + opt$inv_slack) %>%
+  group_by(id) %>%
+  summarise(inversion_len = sum(query_len), inversion_cons_start = min(cons_begin), inversion_cons_end = max(cons_end),
+            inner_cend = cons_end[which.max(query_end)])
+calls <- calls %>%
+  left_join(inversions, by = "id") %>%
+  mutate(inversion_len = coalesce(inversion_len, 0L),
+         five_prime_inversion = inversion_len >= opt$min_inversion,
+         inversion_junction = if_else(five_prime_inversion, cons_start - inner_cend - 1L, NA_integer_)) %>%
+  select(-inner_cend)
 
-## Maximal A-rich segments (0-based half-open, absolute) in sense[ws+1 .. end]:
+## Internal deletions / rearrangements between consecutive sense hits of one element
+deletions <- sense_core %>%
+  group_by(id) %>%
+  mutate(next_cons_begin = lead(cons_begin), next_query_start = lead(query_start), next_name = lead(repeat_name)) %>%
+  ungroup() %>%
+  filter(!is.na(next_cons_begin),
+         repeat_name == next_name | stri_detect_regex(next_name, SPLIT_3P_RE) | stri_detect_regex(repeat_name, "_5end$")) %>%
+  mutate(cons_gap = next_cons_begin - cons_end - 1L, query_gap = next_query_start - query_end - 1L,
+         missing = cons_gap - pmax(query_gap, 0L)) %>%
+  group_by(id) %>%
+  summarise(internal_deletion_bp = sum(pmax(0L, missing) * (missing >= opt$min_internal_gap)),
+            internal_rearrangement = any(cons_gap < -opt$min_internal_gap))
+calls <- calls %>%
+  left_join(deletions, by = "id") %>%
+  mutate(internal_deletion_bp = coalesce(internal_deletion_bp, 0L),
+         internal_deletion = internal_deletion_bp > 0,
+         internal_rearrangement = coalesce(internal_rearrangement, FALSE))
+
+## snRNA chimeras and other repeats inside the insertion
+SNRNA_RE <- "snRNA|scRNA|srpRNA|7SL|U6|U3|7SK"
+snrna_hits <- nontail_hits %>%
+  filter(stri_detect_regex(repeat_class, SNRNA_RE) | stri_detect_regex(repeat_name, SNRNA_RE))
+calls <- calls %>%
+  left_join(snrna_hits %>% group_by(id) %>% summarise(snRNA_name = paste(sort(unique(repeat_name)), collapse = ",")),
+            by = "id") %>%
+  mutate(snRNA_chimera = !is.na(snRNA_name) & has_main) %>%
+  left_join(nontail_hits %>%
+              filter(!(id %in% snrna_hits$id & repeat_name %in% snrna_hits$repeat_name),
+                     !repeat_class %in% c("Simple_repeat", "Low_complexity")) %>%
+              group_by(id) %>% summarise(other_repeat_bp = sum(query_len)), by = "id") %>%
+  mutate(other_repeat_bp = coalesce(other_repeat_bp, 0L))
+
+## ---- Classification: poly(A) tails ----------------------------------------------------
+
+## Maximal A-rich segments (0-based half-open, absolute) in seqs[from+1 ..]:
 ## runs of A merged across <= 2 non-A bases; kept if >= min_len and >= frac A.
 ## Leading sparse runs are trimmed off so they cannot sink a real tail.
-find_tails <- function(ids, seqs, ws, min_len, frac) {
-  win <- stri_sub(seqs, ws + 1L)
-  loc <- stri_locate_all_regex(win, "A+(?:[^A]{1,2}A+)*", omit_no_match = TRUE)
-  n <- vapply(loc, nrow, 1L)
-  if (!sum(n)) return(data.table(id = character(), s = integer(), e = integer()))
-  m <- do.call(rbind, loc)
-  b <- data.table(id = rep(ids, n), ws = rep(ws, n), st = m[, 1], en = m[, 2])
-  b[, str := stri_sub(rep(win, n), st, en)]
-  b <- b[nchar(str) >= min_len]
-  ok <- function(x) nchar(x) >= min_len & stri_count_fixed(x, "A") / nchar(x) >= frac
-  b[, pass := ok(str)]
-  for (it in 1:100) {
-    todo <- which(!b$pass & stri_detect_regex(b$str, "^A+[^A]{1,2}A"))
+find_tails <- function(ids, seqs, from, min_len, frac) {
+  window <- stri_sub(seqs, from + 1L)
+  runs <- stri_locate_all_regex(window, "A+(?:[^A]{1,2}A+)*", omit_no_match = TRUE)
+  n_runs <- map_int(runs, nrow)
+  if (!sum(n_runs)) return(tibble(id = character(), s = integer(), e = integer()))
+  at <- do.call(rbind, runs)
+  run_id <- rep(ids, n_runs); run_from <- rep(from, n_runs)
+  run_start <- at[, 1]; run_end <- at[, 2]
+  run_seq <- stri_sub(rep(window, n_runs), run_start, run_end)
+  long <- nchar(run_seq) >= min_len
+  run_id <- run_id[long]; run_from <- run_from[long]; run_start <- run_start[long]; run_end <- run_end[long]
+  run_seq <- run_seq[long]
+  is_tail <- function(x) nchar(x) >= min_len & stri_count_fixed(x, "A") / nchar(x) >= frac
+  passes <- is_tail(run_seq)
+  for (iteration in 1:100) {
+    todo <- which(!passes & stri_detect_regex(run_seq, "^A+[^A]{1,2}A"))
     if (!length(todo)) break
-    trimmed <- stri_replace_first_regex(b$str[todo], "^A+[^A]{1,2}", "")
-    b[todo, `:=`(st = st + (nchar(str) - nchar(trimmed)), str = trimmed)]
-    b[todo, pass := ok(str)]
+    trimmed <- stri_replace_first_regex(run_seq[todo], "^A+[^A]{1,2}", "")
+    run_start[todo] <- run_start[todo] + (nchar(run_seq[todo]) - nchar(trimmed))
+    run_seq[todo] <- trimmed
+    passes[todo] <- is_tail(trimmed)
   }
-  b[pass == TRUE, .(id, s = ws + st - 1L, e = ws + en)]
+  tibble(id = run_id[passes], s = run_from[passes] + run_start[passes] - 1L, e = run_from[passes] + run_end[passes])
 }
 
-classify_structures <- function(ins, hits, P) {
-  sx <- to_sense(ins, hits)
-  I <- sx$ins
-  core <- sx$fam[is_core == TRUE]
-  main <- core[strand == "+"]
-  inv <- core[strand == "C"]
-  hex <- sx$fam[is_core == FALSE]
-  is_tail <- stri_detect_regex(sx$other$name, TAIL_REPEAT_RE, case_insensitive = TRUE)
-  tailh <- sx$other[is_tail & strand == "+"]
-  nontail <- sx$other[!is_tail]
+## Search from just before the element's 3' end (or the whole sequence when
+## there is no sense element); RepeatMasker's own tail hits count too.
+calls <- calls %>% mutate(tail_search_from = if_else(has_main, pmax(0L, te_end - 40L), 0L))
+tails <- bind_rows(find_tails(calls$id, calls$sense, calls$tail_search_from, opt$min_polya, opt$polya_min_frac),
+                   tail_hits %>% transmute(id, s = query_start - 1L, e = query_end)) %>%
+  distinct() %>%
+  inner_join(calls %>% select(id, L, te_end, tail_search_from), by = "id") %>%
+  filter(e > tail_search_from)
+terminal_tails <- tails %>%
+  filter(e >= L - opt$terminal_slack) %>%
+  arrange(id, desc(e - s)) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  select(id, term_s = s, term_e = e)
+first_tails <- tails %>%
+  filter(!is.na(te_end), s <= te_end + opt$polya_gap, e > te_end - 10L) %>%
+  arrange(id, s) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  select(id, first_s = s, first_e = e)
+tails_after_element <- tails %>%
+  filter(!is.na(te_end), s <= te_end + opt$polya_gap, e >= te_end) %>%
+  arrange(id, s) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  select(id, after_s = s)
+calls <- calls %>%
+  left_join(terminal_tails, by = "id") %>%
+  left_join(first_tails, by = "id") %>%
+  left_join(tails_after_element, by = "id") %>%
+  mutate(terminal_polyA = !is.na(term_s),
+         polyA_len = if_else(terminal_polyA, term_e - term_s, 0L),
+         internal_polyA = has_main & !is.na(first_s) & terminal_polyA & first_e < term_s)
 
-  R <- I[, .(id, family, subfamily, L, strand, limeaid_flags, intact_flag, sense)]
-  R <- merge(R, core[, .(family_bp = sum(qlen)), by = id], by = "id", all.x = TRUE)
-  R[is.na(family_bp), family_bp := 0L][, family_frac := family_bp / L]
+## ---- Classification: transductions and orphans (Fig. 2 d/f/h) -----------------------
 
-  setorder(main, id, qbeg)
-  agg <- main[, .(sense_start = min(qbeg) - 1L, te_end = max(qend), retained = sum(cend - cbeg + 1L),
-                  divergence = sum(div * qlen) / sum(qlen)), by = id]
-  five <- main[main[, .I[which.min(qbeg)], by = id]$V1, .(id, cons_start = cbeg, five_hit = name, five_cend = cend)]
-  three <- main[main[, .I[which.max(qend)], by = id]$V1,
-                .(id, cons_end = cend, cons_left_3p = cleft, cons_len = cend + cleft, three_hit = name)]
-  tst <- rbind(main[, .(id, qbeg)], hex[, .(id, qbeg)], inv[, .(id, qbeg)])[, .(te_start = min(qbeg) - 1L), by = id]
-  R <- Reduce(function(a, b) merge(a, b, by = "id", all.x = TRUE), list(R, agg, five, three, tst))
-  R[, has_main := !is.na(te_end)]
-
-  ## b/c/i: truncation
-  R[, max5 := unlist(P$max5[family])][, max3 := unlist(P$max3[family])]
-  R[, five_prime_missing := cons_start - 1L]
-  R[, five_prime_truncated := has_main & (stri_detect_regex(five_hit, SPLIT_3P_RE, case_insensitive = TRUE) |
-                                           five_prime_missing > max5)]
-  R[, retained_cons_frac := pmin(1, retained / cons_len)]
-  R[, three_prime_missing := cons_left_3p]
-  R[, three_prime_truncated := has_main & cons_left_3p > max3 & !stri_detect_regex(three_hit, "_5end$")]
-
-  ## e: 5' inversion (opposite-strand family sequence 5' of the sense portion)
-  inv5 <- inv[R[has_main == TRUE, .(id, sense_start)], on = "id", nomatch = 0][qend <= sense_start + P$inv_slack]
-  if (nrow(inv5)) {
-    ia <- inv5[, .(inversion_len = sum(qlen), inversion_cons_start = min(cbeg), inversion_cons_end = max(cend),
-                   inner_cend = cend[which.max(qend)]), by = id]
-    R <- merge(R, ia, by = "id", all.x = TRUE)
-  } else {
-    R[, `:=`(inversion_len = NA_integer_, inversion_cons_start = NA_integer_,
-             inversion_cons_end = NA_integer_, inner_cend = NA_integer_)]
-  }
-  R[is.na(inversion_len), inversion_len := 0L]
-  R[, five_prime_inversion := inversion_len >= P$min_inv]
-  ## junction > 0: deletion at the inversion point, < 0: duplication (Ostertag & Kazazian 2001)
-  R[five_prime_inversion == TRUE, inversion_junction := cons_start - inner_cend - 1L]
-  if (!"inversion_junction" %in% names(R)) R[, inversion_junction := NA_integer_]
-  R[, inner_cend := NULL]
-
-  ## internal deletions / rearrangements between consecutive sense hits
-  main[, `:=`(nb = shift(cbeg, -1), nq = shift(qbeg, -1), nn = shift(name, -1)), by = id]
-  pairs <- main[!is.na(nb) & (name == nn | stri_detect_regex(nn, SPLIT_3P_RE) | stri_detect_regex(name, "_5end$"))]
-  pairs[, `:=`(cgap = nb - cend - 1L, qgap = nq - qend - 1L)]
-  pd <- pairs[, .(internal_deletion_bp = sum(pmax(0L, (cgap - pmax(qgap, 0L))) * ((cgap - pmax(qgap, 0L)) >= P$min_gap)),
-                  internal_rearrangement = any(cgap < -P$min_gap)), by = id]
-  R <- merge(R, pd, by = "id", all.x = TRUE)
-  R[is.na(internal_deletion_bp), internal_deletion_bp := 0L]
-  R[, internal_deletion := internal_deletion_bp > 0]
-  R[is.na(internal_rearrangement), internal_rearrangement := FALSE]
-
-  ## snRNA chimeras, other repeats
-  sn <- nontail[stri_detect_regex(rclass, SNRNA_RE) | stri_detect_regex(name, SNRNA_RE)]
-  R <- merge(R, sn[, .(snRNA_name = paste(sort(unique(name)), collapse = ",")), by = id], by = "id", all.x = TRUE)
-  R[, snRNA_chimera := !is.na(snRNA_name) & has_main]
-  ot <- nontail[!(id %in% sn$id & name %in% sn$name) & !rclass %in% c("Simple_repeat", "Low_complexity")]
-  R <- merge(R, ot[, .(other_repeat_bp = sum(qlen)), by = id], by = "id", all.x = TRUE)
-  R[is.na(other_repeat_bp), other_repeat_bp := 0L]
-
-  ## poly(A) tails: search from just before the element's 3' end (or the
-  ## whole sequence when there is no sense element)
-  R[, ws := fifelse(has_main, pmax(0L, te_end - 40L), 0L)]
-  tails <- rbind(find_tails(R$id, R$sense, R$ws, P$min_polya, P$polya_frac),
-                 tailh[, .(id, s = qbeg - 1L, e = qend)])
-  tails <- unique(tails)[R[, .(id, L, te_end, ws)], on = "id", nomatch = 0][e > ws]
-  term <- tails[e >= L - P$slack][order(id, -(e - s))][, .SD[1], by = id][, .(id, term_s = s, term_e = e)]
-  first <- tails[!is.na(te_end) & s <= te_end + P$polya_gap & e > te_end - 10L][order(id, s)][, .SD[1], by = id][
-    , .(id, first_s = s, first_e = e)]
-  after <- tails[!is.na(te_end) & s <= te_end + P$polya_gap & e >= te_end][order(id, s)][, .SD[1], by = id][
-    , .(id, after_s = s)]
-  R <- Reduce(function(a, b) merge(a, b, by = "id", all.x = TRUE), list(R, term, first, after))
-  R[, terminal_polyA := !is.na(term_s)]
-  R[, polyA_len := fifelse(terminal_polyA, term_e - term_s, 0L)]
-  R[, internal_polyA := has_main & !is.na(first_s) & terminal_polyA & first_e < term_s]
-
-  ## d: 3' transduction
-  R[, `:=`(tdx3_start = NA_integer_, tdx3_end = NA_integer_, tdx3_masked_frac = NA_real_, tdx3_type = NA_character_)]
-  R[has_main & terminal_polyA, `:=`(tdx3_start = fifelse(internal_polyA, first_e, te_end), tdx3_end = term_s)]
-  R[, tdx3_len := tdx3_end - tdx3_start]
-  cand3 <- R[!is.na(tdx3_len) & tdx3_len >= P$min_td, .(id, s = tdx3_start, e = tdx3_end)]
-  if (nrow(cand3)) R[cand3, on = "id", tdx3_masked_frac := masked_frac(cand3, nontail)]
-  R[, three_prime_transduction := !is.na(tdx3_masked_frac) & tdx3_masked_frac <= P$max_td_masked]
-  R[three_prime_transduction == FALSE, `:=`(tdx3_start = NA_integer_, tdx3_end = NA_integer_, tdx3_len = NA_integer_)]
-  R[three_prime_transduction == TRUE, tdx3_type := fifelse(internal_polyA, "TE-A-unique-A", "TE-unique-A")]
-  R[, unresolved_3p_extension := has_main & !terminal_polyA & (L - te_end - P$slack) >= P$min_td]
-
-  ## orphan candidates: no sense element, unique sequence + terminal poly(A)
-  R[, orphan_candidate := FALSE]
-  orph <- R[has_main == FALSE & terminal_polyA, .(id, s = 0L, e = term_s)]
-  if (nrow(orph)) {
-    orph[, uniq := (e - s) * (1 - masked_frac(orph, sx$other))]
-    R[orph, on = "id", orphan_candidate := i.uniq >= P$min_orphan]
-    R[orphan_candidate == TRUE, `:=`(tdx3_start = 0L, tdx3_end = term_s, tdx3_len = term_s)]
-  }
-
-  ## f/h: 5' foreign sequence -> 5' transduction (intact element 5' end) or
-  ## exon-trapping candidate (internally starting element, spliced junction)
-  R[, `:=`(five_prime_transduction = FALSE, exon_trapping_candidate = FALSE,
-           tdx5_len = NA_integer_, tdx5_end = NA_integer_, tdx5_masked_frac = NA_real_,
-           tdx5_t_rich_head = NA, tdx5_junction_dinuc = NA_character_)]
-  cand5 <- R[has_main & (te_start - P$slack) >= P$min_td, .(id, s = P$slack, e = te_start)]
-  if (nrow(cand5)) {
-    R[cand5, on = "id", tdx5_masked_frac := masked_frac(cand5, nontail)]
-    R[id %in% cand5$id, tdx5_t_rich_head := stri_count_fixed(stri_sub(sense, 1, 20), "T") / 20 >= 0.8]
-    ok5 <- R$id %in% cand5$id & R$tdx5_masked_frac <= P$max_td_masked & !R$tdx5_t_rich_head
-    ok5[is.na(ok5)] <- FALSE
-    R[ok5 & five_prime_truncated & !five_prime_inversion, exon_trapping_candidate := TRUE]
-    R[ok5 & !exon_trapping_candidate, five_prime_transduction := TRUE]
-    R[exon_trapping_candidate == TRUE, tdx5_junction_dinuc := stri_sub(sense, pmax(1L, te_start - 1L), te_start)]
-    R[five_prime_transduction | exon_trapping_candidate, `:=`(tdx5_len = te_start, tdx5_end = te_start)]
-  }
-
-  ## g/i: mechanism of 3' truncation
-  R[, `:=`(three_prime_end_A_frac = NA_real_, pas_upstream_of_tail = NA)]
-  R[three_prime_truncated == TRUE, three_prime_end_A_frac :=
-      stri_count_fixed(stri_sub(sense, pmax(1L, te_end - 19L), te_end), "A") /
-      nchar(stri_sub(sense, pmax(1L, te_end - 19L), te_end))]
-  R[three_prime_truncated == TRUE, pas_upstream_of_tail := {
-    anchor <- fifelse(is.na(after_s), te_end, after_s)
-    stri_detect_regex(stri_sub(sense, pmax(1L, anchor - 39L), pmax(0L, anchor - 5L)), PAS_RE)
-  }]
-  R[, internal_priming := three_prime_truncated & !is.na(three_prime_end_A_frac) & three_prime_end_A_frac >= 0.7]
-  R[, premature_polyadenylation := three_prime_truncated & !internal_priming & !is.na(after_s) & pas_upstream_of_tail %in% TRUE]
-
-  ## combined label and transduced sequences
-  R[, full_length := has_main & !five_prime_truncated & !five_prime_inversion & !three_prime_truncated]
-  flag_order <- c("five_prime_truncated", "five_prime_inversion", "three_prime_truncated", "internal_priming",
-                  "premature_polyadenylation", "internal_deletion", "internal_rearrangement",
-                  "three_prime_transduction", "five_prime_transduction", "exon_trapping_candidate", "snRNA_chimera")
-  lab <- do.call(cbind, lapply(flag_order, function(f) fifelse(R[[f]] %in% TRUE, f, NA_character_)))
-  lab <- cbind(lab, fifelse(R$has_main & !R$terminal_polyA, "no_terminal_polyA", NA_character_))
-  R[, structure := apply(lab, 1, function(z) paste(z[!is.na(z)], collapse = "+"))]
-  R[structure == "", structure := "full_length_canonical"]
-  R[has_main == FALSE, structure := "no_element"]
-  R[, `:=`(tdx3_seq = NA_character_, tdx5_seq = NA_character_)]
-  R[!is.na(tdx3_len), tdx3_seq := stri_sub(sense, tdx3_start + 1L, tdx3_end)]
-  R[five_prime_transduction | exon_trapping_candidate, tdx5_seq := stri_sub(sense, 1L, te_start)]
-  R[, c("max5", "max3", "ws", "term_s", "term_e", "first_s", "first_e", "after_s", "sense", "five_cend") := NULL]
-  R
+## Fraction of each interval [s, e) (0-based) covered by hits (query_start..query_end, 1-based).
+masked_frac <- function(intervals, hits) {
+  if (!nrow(intervals)) return(numeric())
+  covered <- intervals %>%
+    mutate(row = row_number()) %>%
+    inner_join(hits %>% select(id, query_start, query_end), by = "id", relationship = "many-to-many") %>%
+    group_by(row) %>%
+    summarise(covered = sum(pmax(0L, pmin(e, query_end) - pmax(s, query_start - 1L))))
+  bp <- numeric(nrow(intervals))
+  bp[covered$row] <- covered$covered
+  pmin(1, bp / pmax(1, intervals$e - intervals$s))
 }
+
+## Simple-repeat / low-complexity sequence at either end of a transduction
+## candidate cannot be traced and is usually element (the SVA hexamer called
+## CT-rich) or calling noise, so it is trimmed off; interior copies sit
+## between unique flank and stay. Intervals are 0-based half-open.
+simple_by_id <- split(nontail_hits %>% filter(stri_detect_regex(repeat_class, "Simple_repeat|Low_complexity")) %>%
+                        select(id, query_start, query_end), ~ id)
+trim_simple <- function(intervals) {
+  for (i in seq_len(nrow(intervals))) {
+    simple <- simple_by_id[[intervals$id[i]]]
+    if (is.null(simple)) next
+    s <- intervals$s[i]; e <- intervals$e[i]
+    repeat {
+      at_start <- simple$query_end[simple$query_start - 1L <= s + 2L & simple$query_end > s & simple$query_start - 1L < e]
+      at_end <- simple$query_start[simple$query_end >= e - 2L & simple$query_start - 1L < e & simple$query_end > s]
+      if (!length(at_start) && !length(at_end)) break
+      if (length(at_start)) s <- max(at_start)
+      if (length(at_end)) e <- min(at_end) - 1L
+      if (e <= s) break
+    }
+    intervals$s[i] <- as.integer(s); intervals$e[i] <- as.integer(max(s, e))
+  }
+  intervals
+}
+
+## 3' transduction: unique sequence between the element (or its first, internal
+## poly(A)) and the terminal poly(A)
+candidates_3p <- calls %>%
+  filter(has_main, terminal_polyA) %>%
+  transmute(id, s = if_else(internal_polyA, first_e, te_end), e = term_s)
+trimmed_3p <- trim_simple(candidates_3p %>% filter(e > s)) %>% rename(trim_s = s, trim_e = e)
+candidates_3p <- candidates_3p %>%
+  left_join(trimmed_3p, by = "id") %>%
+  mutate(trimmed_bp = if_else(is.na(trim_s), 0L, (e - s) - (trim_e - trim_s)),
+         s = coalesce(trim_s, s), e = coalesce(trim_e, e)) %>%
+  select(-trim_s, -trim_e)
+long_3p <- candidates_3p %>% filter(e - s >= opt$min_transduction)
+long_3p$masked <- masked_frac(long_3p, nontail_hits)
+calls <- calls %>%
+  left_join(candidates_3p %>% rename(c3_s = s, c3_e = e, c3_trimmed = trimmed_bp), by = "id") %>%
+  left_join(long_3p %>% select(id, tdx3_masked_frac = masked), by = "id") %>%
+  mutate(three_prime_transduction = !is.na(tdx3_masked_frac) & tdx3_masked_frac <= opt$max_transduction_masked,
+         tdx3_start = if_else(three_prime_transduction, c3_s, NA_integer_),
+         tdx3_end = if_else(three_prime_transduction, c3_e, NA_integer_),
+         tdx3_len = tdx3_end - tdx3_start,
+         tdx3_trimmed_bp = if_else(three_prime_transduction, c3_trimmed, 0L),
+         tdx3_type = case_when(three_prime_transduction & internal_polyA ~ "TE-A-unique-A",
+                               three_prime_transduction ~ "TE-unique-A",
+                               TRUE ~ NA_character_),
+         unresolved_3p_extension = has_main & !terminal_polyA & (L - te_end - opt$terminal_slack) >= opt$min_transduction) %>%
+  select(-c3_s, -c3_e, -c3_trimmed)
+
+## orphan candidates: no sense element, unique sequence + terminal poly(A)
+orphans <- calls %>% filter(!has_main, terminal_polyA) %>% transmute(id, s = 0L, e = term_s)
+orphans$unique_bp <- (orphans$e - orphans$s) * (1 - masked_frac(orphans, other_hits))
+calls <- calls %>%
+  left_join(orphans %>% select(id, orphan_unique_bp = unique_bp), by = "id") %>%
+  mutate(orphan_candidate = (orphan_unique_bp >= opt$min_orphan) %in% TRUE,
+         tdx3_start = if_else(orphan_candidate, 0L, tdx3_start),
+         tdx3_end = if_else(orphan_candidate, term_s, tdx3_end),
+         tdx3_len = if_else(orphan_candidate, term_s, tdx3_len)) %>%
+  select(-orphan_unique_bp)
+
+## 5' foreign sequence -> 5' transduction (intact element 5' end) or
+## exon-trapping candidate (internally starting element, spliced junction)
+trimmed_5p <- trim_simple(calls %>% filter(has_main, te_start > 0) %>% transmute(id, s = 0L, e = te_start))
+calls <- calls %>%
+  left_join(trimmed_5p %>% rename(t5_s = s, t5_e = e), by = "id") %>%
+  mutate(tdx5_trimmed_bp = if_else(is.na(t5_s), 0L, te_start - (t5_e - t5_s)))
+candidates_5p <- calls %>%
+  filter(has_main, !is.na(t5_e), (t5_e - pmax(t5_s, opt$terminal_slack)) >= opt$min_transduction) %>%
+  transmute(id, s = pmax(t5_s, opt$terminal_slack), e = t5_e)
+candidates_5p$masked <- masked_frac(candidates_5p, nontail_hits)
+calls <- calls %>%
+  left_join(candidates_5p %>% select(id, tdx5_masked_frac = masked), by = "id") %>%
+  mutate(is_candidate_5p = id %in% candidates_5p$id,
+         tdx5_t_rich_head = if_else(is_candidate_5p, stri_count_fixed(stri_sub(sense, 1, 20), "T") / 20 >= 0.8, NA),
+         foreign_5p = (is_candidate_5p & tdx5_masked_frac <= opt$max_transduction_masked & !tdx5_t_rich_head) %in% TRUE,
+         exon_trapping_candidate = foreign_5p & five_prime_truncated & !five_prime_inversion & !sva_f1,
+         five_prime_transduction = foreign_5p & !exon_trapping_candidate,
+         tdx5_junction_dinuc = if_else(exon_trapping_candidate, stri_sub(sense, pmax(1L, te_start - 1L), te_start), NA_character_),
+         called_5p = five_prime_transduction | exon_trapping_candidate,
+         tdx5_start = if_else(called_5p, t5_s, NA_integer_),
+         tdx5_end = if_else(called_5p, t5_e, NA_integer_),
+         tdx5_len = tdx5_end - tdx5_start,
+         tdx5_trimmed_bp = if_else(called_5p, tdx5_trimmed_bp, 0L)) %>%
+  select(-t5_s, -t5_e, -is_candidate_5p, -foreign_5p, -called_5p)
+
+## ---- Classification: mechanism of 3' truncation and the structure label (Fig. 2 g/i) -----
+
+PAS_RE <- "AATAAA|ATTAAA|AGTAAA|TATAAA|CATAAA|GATAAA|AATATA|AATACA|AATAGA|ACTAAA|AAGAAA|AATGAA"
+STRUCTURE_FLAGS <- c("five_prime_truncated", "five_prime_inversion", "three_prime_truncated", "internal_priming",
+                     "premature_polyadenylation", "internal_deletion", "internal_rearrangement",
+                     "three_prime_transduction", "five_prime_transduction", "exon_trapping_candidate", "snRNA_chimera")
+calls <- calls %>%
+  mutate(element_end_20 = stri_sub(sense, pmax(1L, te_end - 19L), te_end),
+         three_prime_end_A_frac = if_else(three_prime_truncated %in% TRUE,
+                                          stri_count_fixed(element_end_20, "A") / nchar(element_end_20), NA_real_),
+         pas_anchor = if_else(is.na(after_s), te_end, after_s),
+         pas_upstream_of_tail = if_else(three_prime_truncated %in% TRUE,
+                                        stri_detect_regex(stri_sub(sense, pmax(1L, pas_anchor - 39L), pmax(0L, pas_anchor - 5L)), PAS_RE),
+                                        NA),
+         internal_priming = three_prime_truncated & !is.na(three_prime_end_A_frac) & three_prime_end_A_frac >= 0.7,
+         premature_polyadenylation = three_prime_truncated & !internal_priming & !is.na(after_s) & pas_upstream_of_tail %in% TRUE,
+         full_length = has_main & !five_prime_truncated & !five_prime_inversion & !three_prime_truncated) %>%
+  select(-element_end_20, -pas_anchor)
+structure_parts <- map(STRUCTURE_FLAGS, ~ if_else(calls[[.x]] %in% TRUE, .x, NA_character_))
+structure_parts <- c(structure_parts, list(if_else(calls$has_main & !calls$terminal_polyA, "no_terminal_polyA", NA_character_)))
+calls <- calls %>%
+  mutate(structure = pmap_chr(structure_parts, function(...) paste(na.omit(c(...)), collapse = "+")),
+         structure = case_when(!has_main ~ "no_element", structure == "" ~ "full_length_canonical", TRUE ~ structure),
+         tdx3_seq = if_else(!is.na(tdx3_len), stri_sub(sense, tdx3_start + 1L, tdx3_end), NA_character_),
+         tdx5_seq = if_else(five_prime_transduction | exon_trapping_candidate, stri_sub(sense, tdx5_start + 1L, tdx5_end), NA_character_)) %>%
+  select(-max5, -max3, -tail_search_from, -term_s, -term_e, -first_s, -first_e, -after_s, -sense, -five_cend)
+
+## ---- Per-sequence table -------------------------------------------------------------
 
 FLAGS <- c("full_length", "five_prime_truncated", "three_prime_transduction", "five_prime_inversion",
            "five_prime_transduction", "internal_priming", "exon_trapping_candidate", "three_prime_truncated",
            "premature_polyadenylation", "internal_deletion", "internal_rearrangement", "orphan_candidate",
            "snRNA_chimera", "terminal_polyA", "internal_polyA")
+per_seq <- insertions %>%
+  select(id, limeaid_id, variant_id, chrom, pos, ALT_md5, uid) %>%
+  mutate(seq_md5 = uid) %>%
+  inner_join(representatives %>% inner_join(calls, by = "id") %>% select(-id), by = "uid") %>%
+  arrange(uid) %>%
+  select(-uid) %>%
+  mutate(across(all_of(FLAGS), ~ coalesce(.x, FALSE)))
 
-res <- classify_structures(ins[.(rep_ids$id), on = "id"], hits[id %in% rep_ids$id], P)
-res <- merge(rep_ids, res, by = "id")[, id := NULL]
-per_seq <- merge(ins[, .(id, limeaid_id, variant_id, chrom, pos, ALT_md5, uid)][, seq_md5 := uid],
-                 res, by = "uid")
-per_seq[, uid := NULL]
-for (f in FLAGS) per_seq[is.na(get(f)), (f) := FALSE]
+## Genotypes: haplotypes carrying each catalogued allele (one row per allele and
+## individual, keyed like the allele table, POS = its `start`). hap1/hap2 say
+## which haplotypes carry it; GT is used only where they are missing. A
+## variant's AF is its alleles' carried haplotypes over AN = 2 x cohort size.
+genotype_raw <- read_tsv(params$genotype_table, col_types = cols(.default = col_character()), progress = FALSE)
+if (!all(c("CHROM", "POS", "ALT_md5", "indiv") %in% names(genotype_raw))) {
+  stop(params$genotype_table, ": genotype table needs columns CHROM, POS, ALT_md5, indiv")
+}
+as_haplotype <- function(x) {
+  x <- toupper(stri_trim_both(x))
+  case_when(x %in% c("TRUE", "T", "1") ~ TRUE, x %in% c("FALSE", "F", "0") ~ FALSE, TRUE ~ NA)
+}
+gt_alleles <- if ("GT" %in% names(genotype_raw)) stri_split_regex(genotype_raw$GT, "[/|]", simplify = TRUE) else
+  matrix(NA_character_, nrow(genotype_raw), 2)
+genotypes <- tibble(
+  chrom = genotype_raw$CHROM, pos = as.integer(genotype_raw$POS), ALT_md5 = tolower(genotype_raw$ALT_md5),
+  indiv = genotype_raw$indiv,
+  hap1 = if ("hap1" %in% names(genotype_raw)) as_haplotype(genotype_raw$hap1) else NA,
+  hap2 = if ("hap2" %in% names(genotype_raw)) as_haplotype(genotype_raw$hap2) else NA,
+  gt1 = gt_alleles[, 1] %in% "1",
+  gt2 = (if (ncol(gt_alleles) > 1) gt_alleles[, 2] else NA_character_) %in% "1"
+) %>%
+  mutate(hap1 = coalesce(hap1, gt1), hap2 = coalesce(hap2, gt2)) %>%
+  group_by(chrom, pos, ALT_md5, indiv) %>%      # a repeated row for one allele and individual counts once
+  summarise(hap1 = any(hap1), hap2 = any(hap2), .groups = "drop")
+n_individuals <- as.integer(params$n_individuals)
+if (is.na(n_individuals) || n_individuals <= 0) n_individuals <- n_distinct(genotypes$indiv)
+allele_number <- 2L * n_individuals
+carriers <- genotypes %>% filter(hap1 | hap2)
+allele_counts <- carriers %>%
+  group_by(chrom, pos, ALT_md5) %>%
+  summarise(allele_count = sum(hap1) + sum(hap2), n_carriers = n(), .groups = "drop")
+per_seq <- per_seq %>%
+  left_join(allele_counts, by = c("chrom", "pos", "ALT_md5")) %>%
+  mutate(allele_count = coalesce(allele_count, 0L), n_carriers = coalesce(n_carriers, 0L),
+         af = allele_count / allele_number)
+variant_genotypes <- carriers %>%
+  inner_join(per_seq %>% distinct(chrom, pos, ALT_md5, variant_id), by = c("chrom", "pos", "ALT_md5"),
+             relationship = "many-to-many") %>%
+  group_by(variant_id) %>%
+  summarise(n_carriers = n_distinct(indiv), allele_count = sum(hap1) + sum(hap2))
+n_unmatched <- nrow(anti_join(allele_counts, per_seq, by = c("chrom", "pos", "ALT_md5")))
+message(sprintf("genotype table: %d individuals (AN = %d); %d of %d catalogued alleles carried by someone; %d genotyped alleles not in the catalog.",
+                n_individuals, allele_number, sum(per_seq$allele_count > 0), nrow(per_seq), n_unmatched))
+if (!any(per_seq$allele_count > 0)) stop("No catalogued allele matched the genotype table on CHROM + POS + ALT_md5")
+write_tsv(per_seq %>% select(-tdx3_seq, -tdx5_seq), out_file("per_sequence.tsv.gz"), na = "NA")
+message("wrote ", out_file("per_sequence.tsv.gz"), " (", nrow(per_seq), " rows)")
 
-## Genotypes: haplotypes carrying each catalogued allele. A variant's AF is
-## its alleles' carried haplotypes over AN = 2 x cohort size.
-G <- read_genotypes(params$genotype_table)
-n_ind <- p_int(params$n_individuals)
-if (is.na(n_ind) || n_ind <= 0) n_ind <- uniqueN(G$indiv)
-AN <- 2L * n_ind
-G <- G[hap1 | hap2]
-ac <- G[, .(allele_count = sum(hap1) + sum(hap2), n_carriers = .N), by = .(chrom, pos, ALT_md5)]
-per_seq[ac, on = .(chrom, pos, ALT_md5), `:=`(allele_count = i.allele_count, n_carriers = i.n_carriers)]
-per_seq[is.na(allele_count), `:=`(allele_count = 0L, n_carriers = 0L)]
-per_seq[, af := allele_count / AN]
-carried <- G[unique(per_seq[, .(chrom, pos, ALT_md5, variant_id)]), on = .(chrom, pos, ALT_md5), nomatch = 0]
-var_gt <- carried[, .(n_carriers = uniqueN(indiv), allele_count = sum(hap1) + sum(hap2)), by = variant_id]
-n_unmatched <- nrow(ac[!per_seq, on = .(chrom, pos, ALT_md5)])
-LOG("genotype table: %d individuals (AN = %d); %d of %d catalogued alleles carried by someone; %d genotyped alleles not in the catalog.",
-    n_ind, AN, per_seq[allele_count > 0, .N], nrow(per_seq), n_unmatched)
-if (!per_seq[allele_count > 0, .N]) stop("No catalogued allele matched the genotype table on CHROM + POS + ALT_md5")
-save_tab(per_seq[, !c("tdx3_seq", "tdx5_seq"), with = FALSE], "per_sequence", "tsv.gz")
+## ---- Per-variant rollup -------------------------------------------------------------
+## Modal structure, majority flags, medians and concordance, each sequence
+## weighted by the haplotypes carrying it (a variant none of whose alleles is
+## carried falls back to equal weights).
 
-## Variant-level rollup: modal structure, majority flags, medians and
-## concordance, each sequence weighted by the haplotypes carrying it (a
-## variant none of whose alleles is carried falls back to equal weights).
-per_seq[, w := as.numeric(allele_count)]
-per_seq[, w := if (sum(w) > 0) w else rep(1, .N), by = variant_id]
-wmode <- function(x, w) { s <- tapply(w, x, sum); names(s)[which.max(s)] }
-num_cols <- c("L", "five_prime_missing", "three_prime_missing", "retained_cons_frac", "polyA_len",
-              "tdx3_len", "tdx5_len", "inversion_len", "divergence")
-per_var <- per_seq[, c(
-  list(family = family[1], subfamily = wmode(fifelse(is.na(subfamily), "NA", subfamily), w),
-       chrom = chrom[1], pos = pos[1], n_sequences = .N, n_distinct_seqs = uniqueN(seq_md5),
-       structure = wmode(structure, w)),
-  lapply(.SD[, FLAGS, with = FALSE], function(x) sum(w * x) / sum(w) >= 0.5),
-  lapply(.SD[, num_cols, with = FALSE], function(x) wmedian(x, w))
-), by = variant_id]
-conc <- per_seq[per_var[, .(variant_id, modal = structure)], on = "variant_id"][
-  , .(structure_concordance = sum(w * (structure == modal)) / sum(w), allele_concordance = mean(structure == modal)),
-  by = variant_id]
-per_var <- merge(per_var, conc, by = "variant_id")
-per_var <- merge(per_var, var_gt, by = "variant_id", all.x = TRUE)
-per_var[is.na(n_carriers), `:=`(n_carriers = 0L, allele_count = 0L)]
-per_var[, af := allele_count / AN]
-per_seq[, w := NULL]
-save_tab(per_var, "per_variant")
-LOG("%d sequences -> %d variants.", nrow(per_seq), nrow(per_var))
+weighted_mode <- function(x, w) { totals <- tapply(w, x, sum); names(totals)[which.max(totals)] }
+weighted_median <- function(x, w) {
+  ok <- !is.na(x) & !is.na(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  x <- x[ok]; w <- w[ok]
+  ord <- order(x)
+  as.numeric(x[ord][which(cumsum(w[ord]) >= sum(w) / 2)[1]])
+}
+MEDIAN_COLS <- c("L", "five_prime_missing", "three_prime_missing", "retained_cons_frac", "polyA_len",
+                 "tdx3_len", "tdx5_len", "inversion_len", "divergence")
+weighted <- per_seq %>%
+  group_by(variant_id) %>%
+  mutate(w = as.numeric(allele_count), w = if (sum(w) > 0) w else rep(1, n())) %>%
+  ungroup()
+per_var <- weighted %>%
+  group_by(variant_id) %>%
+  summarise(family = family[1], subfamily = weighted_mode(coalesce(subfamily, "NA"), w),
+            chrom = chrom[1], pos = pos[1], n_sequences = n(), n_distinct_seqs = n_distinct(seq_md5),
+            structure = weighted_mode(structure, w),
+            across(all_of(FLAGS), ~ sum(w * .x) / sum(w) >= 0.5),
+            across(all_of(MEDIAN_COLS), ~ weighted_median(.x, w)),
+            .groups = "drop")
+concordance <- weighted %>%
+  inner_join(per_var %>% select(variant_id, modal = structure), by = "variant_id") %>%
+  group_by(variant_id) %>%
+  summarise(structure_concordance = sum(w * (structure == modal)) / sum(w),
+            allele_concordance = mean(structure == modal))
+per_var <- per_var %>%
+  inner_join(concordance, by = "variant_id") %>%
+  left_join(variant_genotypes, by = "variant_id") %>%
+  mutate(n_carriers = coalesce(n_carriers, 0L), allele_count = coalesce(allele_count, 0L),
+         af = allele_count / allele_number) %>%
+  arrange(variant_id)
+write_tsv(per_var, out_file("per_variant.tsv"), na = "NA")
+message("wrote ", out_file("per_variant.tsv"), " (", nrow(per_var), " rows)")
+message(sprintf("%d sequences -> %d variants.", nrow(per_seq), nrow(per_var)))
 
-## One transduced segment per variant (the one carried by most sequences),
-## named variant|kind|family|chrom|pos for source tracing.
-tdx <- rbind(
-  per_seq[!is.na(tdx3_seq), .(kind = "3p", seq = tdx3_seq, family, chrom, pos), by = variant_id],
-  per_seq[!is.na(tdx5_seq), .(kind = "5p", seq = tdx5_seq, family, chrom, pos), by = variant_id]
-)[, .N, by = .(variant_id, kind, seq, family, chrom, pos)][order(-N)][, .SD[1], by = .(variant_id, kind)]
-tdx[, name := paste(variant_id, kind, family, chrom, pos, sep = "|")]
-tdx_fa <- tab_path("transductions", "fa")
-write_fasta(tdx$name, tdx$seq, tdx_fa)
-LOG("wrote %s (%d segments)", tdx_fa, nrow(tdx))
+## One transduced segment per variant and kind (the one carried by most
+## sequences; ties go to the first seen), named variant|kind|family|chrom|pos
+## for source tracing.
+transduced <- bind_rows(
+  per_seq %>% filter(!is.na(tdx3_seq)) %>% transmute(variant_id, kind = "3p", seq = tdx3_seq, family, chrom, pos),
+  per_seq %>% filter(!is.na(tdx5_seq)) %>% transmute(variant_id, kind = "5p", seq = tdx5_seq, family, chrom, pos)
+) %>%
+  mutate(first_seen = row_number()) %>%
+  group_by(variant_id, kind, seq, family, chrom, pos) %>%
+  summarise(n = n(), first_seen = min(first_seen), .groups = "drop") %>%
+  arrange(desc(n), first_seen) %>%
+  distinct(variant_id, kind, .keep_all = TRUE) %>%
+  mutate(name = paste(variant_id, kind, family, chrom, pos, sep = "|"))
+transductions_fa <- out_file("transductions.fa")
+writeLines(paste0(">", transduced$name, "\n", transduced$seq), transductions_fa)
+message(sprintf("wrote %s (%d segments)", transductions_fa, nrow(transduced)))
 
 if (!run_sources) {
-  LOG("No --reference / --transduction-paf: skipping transduction source tracing.")
+  message("No --reference / --transduction-paf: skipping transduction source tracing.")
   quit(save = "no", status = 0)
 }
-if (!nrow(tdx)) {
-  LOG("No transduced segments: nothing to trace.")
+if (!nrow(transduced)) {
+  message("No transduced segments: nothing to trace.")
   quit(save = "no", status = 0)
 }
 
-## ---- Transduction source tracing --------------------------------------------
+## ---- Source tracing: genome mapping ------------------------------------------------
 ## Segments are mapped to the reference; hits within self_window of the
 ## insertion's own site are flanking-sequence capture, not transduction. Each
 ## remaining hit is assigned to a same-family, same-strand element upstream
@@ -739,235 +890,293 @@ if (!nrow(tdx)) {
 ## segments that recur are clustered all-vs-all: shared non-reference sources.
 
 read_paf <- function(path) {
-  l <- readLines(path)
-  if (!length(l)) return(data.table())
-  t <- stri_split_fixed(l, "\t", n = 13, simplify = TRUE)
-  d <- data.table(qname = t[, 1], qlen = as.integer(t[, 2]), qstart = as.integer(t[, 3]), qend = as.integer(t[, 4]),
-                  strand = t[, 5], tname = t[, 6], tlen = as.integer(t[, 7]), tstart = as.integer(t[, 8]),
-                  tend = as.integer(t[, 9]), matches = as.integer(t[, 10]), alen = as.integer(t[, 11]),
-                  mapq = as.integer(t[, 12]))
-  d[, primary := stri_detect_fixed(t[, 13], "tp:A:P")]
-  d
+  lines <- readLines(path)
+  if (!length(lines)) return(tibble())
+  cols <- stri_split_fixed(lines, "\t", n = 13, simplify = TRUE)
+  tibble(qname = cols[, 1], qlen = as.integer(cols[, 2]), qstart = as.integer(cols[, 3]), qend = as.integer(cols[, 4]),
+         strand = cols[, 5], tname = cols[, 6], tlen = as.integer(cols[, 7]), tstart = as.integer(cols[, 8]),
+         tend = as.integer(cols[, 9]), matches = as.integer(cols[, 10]), alen = as.integer(cols[, 11]),
+         mapq = as.integer(cols[, 12]), primary = stri_detect_fixed(cols[, 13], "tp:A:P"))
 }
-read_elements <- function(path, set) {
-  if (grepl("\\.out(\\.gz)?$", path)) {                       # RepeatMasker .out (whitespace-aligned)
-    l <- if (grepl("\\.gz$", path)) readLines(gzfile(path)) else readLines(path)
-    l <- l[stri_detect_regex(l, "^\\s*\\d")]
-    t <- stri_split_regex(stri_trim_both(l), "\\s+", simplify = TRUE)
-    e <- data.table(chrom = t[, 5], start = as.integer(t[, 6]) - 1L, end = as.integer(t[, 7]),
-                    strand = fifelse(t[, 9] == "+", "+", "-"), name = t[, 10], rclass = t[, 11],
-                    div = as.numeric(t[, 2]) / 100)
-  } else {
-    d <- fread_any(path, header = FALSE, fill = TRUE, colClasses = "character", showProgress = FALSE)
-    if (ncol(d) >= 17 && all(d$V10 %in% c("+", "-"))) {         # UCSC rmsk.txt
-      e <- d[, .(chrom = V6, start = as.integer(V7), end = as.integer(V8), strand = V10, name = V11,
-                 rclass = paste0(V12, "/", V13), div = as.numeric(V3) / 1000)]
-    } else {                                                     # BED
-      e <- d[, .(chrom = V1, start = as.integer(V2), end = as.integer(V3),
-                 name = if (ncol(d) > 3) V4 else ".", strand = if (ncol(d) > 5) V6 else ".",
-                 rclass = if (ncol(d) > 6) V7 else "")]
-    }
-  }
-  e[, set := set]
-  e[!is.na(start)]
+read_fasta <- function(path) {
+  lines <- readLines(path, warn = FALSE)
+  lines <- lines[nzchar(lines)]
+  is_header <- stri_startswith_fixed(lines, ">")
+  record <- cumsum(is_header)
+  ids <- stri_extract_first_regex(stri_sub(lines[is_header], 2), "^\\S+")
+  seqs <- map_chr(split(lines[!is_header], record[!is_header]), paste, collapse = "")
+  tibble(id = ids[as.integer(names(seqs))], seq = toupper(unname(seqs)))
 }
 
 threads <- params$threads
-tseqs <- read_fasta(tdx_fa)
-if (!nrow(tseqs)) tseqs <- data.table(id = character(), seq = character())
-paf <- p_str(params$transduction_paf)
-if (is.null(paf) && nrow(tseqs)) {
-  paf <- tab_path("transductions", "paf")
-  mm2 <- which_tool("minimap2"); if (is.null(mm2)) stop("minimap2 not found on PATH")
-  LOG("Mapping %d transduced segments with minimap2 -x %s", nrow(tseqs), params$minimap2_preset)
-  run_tool(mm2, c("-c", "-x", params$minimap2_preset, "--secondary=yes", "-N", "10", "-p", params$secondary_ratio, "-t", threads,
-                  p_str(params$reference), tdx_fa), stdout = paf)
+transduced_seqs <- read_fasta(transductions_fa)
+paf_path <- params$transduction_paf
+if (!nzchar(paf_path)) {
+  paf_path <- out_file("transductions.paf")
+  if (!nzchar(Sys.which("minimap2"))) stop("minimap2 not found on PATH")
+  message(sprintf("Mapping %d transduced segments with minimap2 -x %s", nrow(transduced_seqs), params$minimap2_preset))
+  status <- system2("minimap2", c("-c", "-x", params$minimap2_preset, "--secondary=yes", "-N", "10", "-p", params$secondary_ratio,
+                                  "-t", threads, params$reference, transductions_fa), stdout = paf_path, stderr = FALSE)
+  if (status != 0) stop("minimap2 failed (exit ", status, ")")
 }
-H <- if (!is.null(paf) && file.exists(paf)) read_paf(paf) else data.table()
-meta <- tseqs[, {s <- stri_split_fixed(id, "|", simplify = TRUE)
-  .(transduction = id, variant_id = s[, 1], kind = s[, 2], family = s[, 3], ins_chrom = s[, 4],
-    ins_pos = suppressWarnings(as.integer(s[, 5])), td_len = nchar(seq))}]
-best <- data.table(qname = character(), tname = character(), tstart = integer(), tend = integer(),
-                   strand = character(), mapq = integer(), identity = numeric(), qcov = numeric(), n_good_hits = integer())
-meta[, maps_to_insertion_site := FALSE]
-Hp <- data.table()
-if (nrow(H)) {
-  H[, `:=`(identity = matches / alen, qcov = (qend - qstart) / qlen)]
-  H <- H[identity >= p_num(params$min_identity)]
-  H <- merge(H, meta[, .(qname = transduction, ins_chrom, ins_pos)], by = "qname")
-  sw <- p_int(params$self_window)
-  H[, self_hit := tname == ins_chrom & !is.na(ins_pos) & (abs(tstart - ins_pos) < sw | abs(tend - ins_pos) < sw)]
-  Hp <- H[qend - qstart >= P$min_td][, `:=`(method = "genome", evalue = NA_real_)]
-  H <- H[qcov >= p_num(params$min_qcov)]
-  meta[, maps_to_insertion_site := transduction %in% H[self_hit == TRUE, qname]]
-  H <- H[self_hit == FALSE]
-  if (nrow(H)) {
-    best <- H[order(qname, -primary, -mapq, -matches)][, .SD[1], by = qname]
-    best[, n_good_hits := H[, .N, by = qname][best, on = "qname", N]]
+paf_hits <- if (file.exists(paf_path)) read_paf(paf_path) else tibble()
+transduction_meta <- transduced_seqs %>%
+  mutate(parts = stri_split_fixed(id, "|", simplify = TRUE)) %>%
+  transmute(transduction = id, variant_id = parts[, 1], kind = parts[, 2], family = parts[, 3], ins_chrom = parts[, 4],
+            ins_pos = suppressWarnings(as.integer(parts[, 5])), td_len = nchar(seq), maps_to_insertion_site = FALSE)
+best_hits <- tibble(qname = character(), tname = character(), tstart = integer(), tend = integer(), strand = character(),
+                    mapq = integer(), identity = numeric(), qcov = numeric(), n_good_hits = integer())
+piece_hits <- tibble()
+if (nrow(paf_hits)) {
+  paf_hits <- paf_hits %>%
+    mutate(identity = matches / alen, qcov = (qend - qstart) / qlen) %>%
+    filter(identity >= opt$min_identity) %>%
+    inner_join(transduction_meta %>% select(qname = transduction, ins_chrom, ins_pos), by = "qname") %>%
+    arrange(qname) %>%
+    mutate(self_hit = tname == ins_chrom & !is.na(ins_pos) &
+             (abs(tstart - ins_pos) < opt$self_window | abs(tend - ins_pos) < opt$self_window))
+  piece_hits <- paf_hits %>%
+    filter(qend - qstart >= opt$min_transduction) %>%
+    mutate(method = "genome", evalue = NA_real_)
+  whole_hits <- paf_hits %>% filter(qcov >= opt$min_qcov)
+  transduction_meta <- transduction_meta %>%
+    mutate(maps_to_insertion_site = transduction %in% whole_hits$qname[whole_hits$self_hit])
+  whole_hits <- whole_hits %>% filter(!self_hit)
+  if (nrow(whole_hits)) {
+    best_hits <- whole_hits %>%
+      arrange(qname, desc(primary), desc(mapq), desc(matches)) %>%
+      distinct(qname, .keep_all = TRUE) %>%
+      left_join(whole_hits %>% count(qname, name = "n_good_hits"), by = "qname")
   }
 }
-src <- merge(meta, best[, .(transduction = qname, src_chrom = tname, src_start = tstart, src_end = tend,
-                            src_strand = strand, mapq, identity, qcov, n_good_hits)], by = "transduction", all.x = TRUE)
-src[, mapping := fifelse(is.na(src_chrom), fifelse(maps_to_insertion_site, "self_only", "unmapped"),
-                 fifelse(mapq >= p_int(params$min_mapq), "unique", "multi"))]
+sources <- transduction_meta %>%
+  left_join(best_hits %>% select(transduction = qname, src_chrom = tname, src_start = tstart, src_end = tend,
+                                 src_strand = strand, mapq, identity, qcov, n_good_hits), by = "transduction") %>%
+  arrange(transduction) %>%
+  mutate(mapping = case_when(is.na(src_chrom) & maps_to_insertion_site ~ "self_only",
+                             is.na(src_chrom) ~ "unmapped",
+                             mapq >= opt$min_mapq ~ "unique",
+                             TRUE ~ "multi"))
 
-## Source element: 3' transduction -> element ends just UPSTREAM of the
-## segment (in the segment's genomic orientation); 5' -> starts just DOWNSTREAM.
-##
+## ---- Source tracing: candidate source elements ---------------------------------------
 ## Candidates are the reference RepeatMasker elements (FIXED sources), any
 ## known_sources BEDs, and every cohort insertion (POLYMORPHIC sources). A
 ## polymorphic source is absent from the reference, but the flank it transduces
 ## is ordinary reference sequence beside its insertion point, so the segment
 ## maps there with no reference element present; the cohort insertion is
 ## entered as a zero-width element at that point, in its own orientation.
-var_strand <- per_seq[strand %in% c("+", "-"), .N, by = .(variant_id, strand)][order(variant_id, -N)][
-  , .SD[1], by = variant_id][, .(variant_id, strand)]
-cohort_E <- per_var[!is.na(chrom) & !is.na(pos), .(chrom, start = as.integer(pos), end = as.integer(pos),
-                                                   name = variant_id, rclass = as.character(family), set = "cohort")]
-cohort_E <- merge(cohort_E, var_strand[, .(name = variant_id, strand)], by = "name")
-RMSK <- if (!is.null(p_str(params$ref_rmsk))) read_elements(params$ref_rmsk, "reference") else NULL
-merge_iv <- function(d) d[order(chrom, start)][, grp := cumsum(c(TRUE, start[-1] > cummax(end)[-.N])), by = chrom][
-  , .(start = min(start), end = max(end)), by = .(chrom, grp)][, grp := NULL]
+
+read_elements <- function(path, set) {
+  if (grepl("\\.out(\\.gz)?$", path)) {                                   # RepeatMasker .out (whitespace-aligned)
+    lines <- readLines(if (grepl("\\.gz$", path)) gzfile(path) else path)
+    cols <- stri_split_regex(stri_trim_both(lines[stri_detect_regex(lines, "^\\s*\\d")]), "\\s+", simplify = TRUE)
+    elements <- tibble(chrom = cols[, 5], start = as.integer(cols[, 6]) - 1L, end = as.integer(cols[, 7]),
+                       strand = if_else(cols[, 9] == "+", "+", "-"), name = cols[, 10], rclass = cols[, 11],
+                       div = as.numeric(cols[, 2]) / 100)
+  } else {
+    table <- read_tsv(path, col_names = FALSE, col_types = cols(.default = col_character()), progress = FALSE)
+    if (ncol(table) >= 17 && all(table$X10 %in% c("+", "-"))) {             # UCSC rmsk.txt
+      elements <- table %>% transmute(chrom = X6, start = as.integer(X7), end = as.integer(X8), strand = X10, name = X11,
+                                      rclass = paste0(X12, "/", X13), div = as.numeric(X3) / 1000)
+    } else {                                                                 # BED
+      elements <- tibble(chrom = table$X1, start = as.integer(table$X2), end = as.integer(table$X3),
+                         name = if (ncol(table) > 3) table$X4 else ".", strand = if (ncol(table) > 5) table$X6 else ".",
+                         rclass = if (ncol(table) > 6) table$X7 else "")
+    }
+  }
+  elements %>% mutate(set = set) %>% filter(!is.na(start))
+}
+merge_intervals <- function(intervals) {
+  intervals %>%
+    arrange(chrom, start) %>%
+    group_by(chrom) %>%
+    mutate(block = cumsum(c(TRUE, start[-1] > cummax(end)[-n()]))) %>%
+    group_by(chrom, block) %>%
+    summarise(start = min(start), end = max(end), .groups = "drop") %>%
+    select(-block)
+}
+
+variant_strand <- per_seq %>%
+  filter(strand %in% c("+", "-")) %>%
+  mutate(seen = row_number()) %>%
+  group_by(variant_id, strand) %>%
+  summarise(n = n(), seen = min(seen), .groups = "drop") %>%
+  arrange(variant_id, desc(n), seen) %>%
+  distinct(variant_id, .keep_all = TRUE)
+cohort_elements <- per_var %>%
+  filter(!is.na(chrom), !is.na(pos)) %>%
+  transmute(chrom, start = as.integer(pos), end = as.integer(pos), name = variant_id, rclass = as.character(family),
+            set = "cohort") %>%
+  inner_join(variant_strand %>% select(name = variant_id, strand), by = "name") %>%
+  arrange(name)
+rmsk <- if (nzchar(params$ref_rmsk)) read_elements(params$ref_rmsk, "reference") else NULL
 ## Genome hits: old repeats (MIR, L2, ...) map uniquely, but young copies, any
 ## Alu (~1M conserved copies) and low-complexity sequence can sit identically
 ## beside the wrong element. The flank library is masked for every repeat: in a
 ## library that small, even an old repeat can have one meaningless copy.
-RM <- if (!is.null(RMSK)) merge_iv(RMSK[is.na(div) | div < p_num(params$repeat_max_div) |
-                                         stri_detect_regex(rclass, "Simple_repeat|Low_complexity|(^|/)Alu")]) else NULL
-RM_ALL <- if (!is.null(RMSK)) merge_iv(RMSK) else NULL
-repeat_bp <- function(chrom, s, e) {
-  out <- numeric(length(chrom))
-  if (is.null(RM) || !length(chrom)) return(out)
-  q <- data.table(chrom = chrom, s = s, e = e, row = seq_along(chrom))
-  o <- RM[q, on = .(chrom, end > s, start < e), nomatch = 0,
-          .(row, bp = pmin(x.end, i.e) - pmax(x.start, i.s))][, .(bp = sum(bp)), by = row]
-  out[o$row] <- o$bp
-  out
-}
-E <- rbindlist(c(
-  if (!is.null(RMSK)) list(RMSK),
-  lapply(Filter(nzchar, stri_split_fixed(params$known_sources, ",")[[1]]), function(b) read_elements(b, basename(b))),
-  list(cohort_E)
-), fill = TRUE)
-LOG("source candidates: %d reference, %d known_sources, %d cohort (polymorphic) insertion sites",
-    E[set == "reference", .N], E[!set %in% c("reference", "cohort"), .N], E[set == "cohort", .N])
-src[, `:=`(source_element = NA_character_, source_class = NA_character_, source_set = NA_character_,
-           source_chrom = NA_character_, source_start = NA_integer_, source_end = NA_integer_,
-           source_strand = NA_character_, source_distance = NA_integer_, source_full_length = NA,
-           source_af = NA_real_)]
-win <- p_int(params$source_window); tol <- p_int(params$overlap_tolerance)
-FAM_RE <- c(Alu = "^SINE/Alu|(^|/)Alu", L1 = "^LINE/L1|(^|/)L1", SVA = "(^|/)SVA")
-E <- E[set != "reference" | stri_detect_regex(rclass, "Alu|L1|SVA")]
-Eend <- E[, .(chrom, pos = end, el_start = start, el_end = end, el_strand = strand, el_name = name, el_class = rclass, set)]
-Est <- E[, .(chrom, pos = start, el_start = start, el_end = end, el_strand = strand, el_name = name, el_class = rclass, set)]
-## m: key, variant_id, family, kind, src_chrom, src_start, src_end, src_strand -> nearest qualifying element per key
-nearest_source <- function(m) {
-  if (!nrow(E) || !nrow(m)) return(data.table(key = character()))
-  m <- copy(m)
-  m[, upstream := (kind == "3p") == (src_strand == "+")]
-  m[, need := fifelse(src_strand == "+", "+", "-")]
-  m[, `:=`(lo = fifelse(upstream, src_start - win, src_end - tol), hi = fifelse(upstream, src_start + tol, src_end + win))]
-  j1 <- Eend[m[upstream == TRUE], on = .(chrom == src_chrom, pos >= lo, pos <= hi), nomatch = 0, allow.cartesian = TRUE,
-             .(key, variant_id, family, need, src_start, el_start, el_end, el_strand, el_name, el_class, set,
-               dist = src_start - el_end)]
-  j2 <- Est[m[upstream == FALSE], on = .(chrom == src_chrom, pos >= lo, pos <= hi), nomatch = 0, allow.cartesian = TRUE,
-            .(key, variant_id, family, need, src_start, el_start, el_end, el_strand, el_name, el_class, set,
-              dist = el_start - src_end)]
-  j <- rbind(j1, j2)
-  j <- j[el_strand %in% c(need, ".") & dist >= -tol & dist <= win]
-  j <- j[!set %in% c("reference", "cohort") | stri_detect_regex(paste0(el_class, "/", el_name), FAM_RE[family])]
-  j <- j[!(set == "cohort" & el_name == variant_id)]
-  j[order(key, abs(dist), -(el_end - el_start))][, .SD[1], by = key]
-}
-j <- nearest_source(src[!is.na(src_chrom), .(key = transduction, variant_id, family, kind,
-                                             src_chrom, src_start, src_end, src_strand)])
-if (nrow(j)) {
-  src[j, on = .(transduction = key), `:=`(source_element = i.el_name, source_class = i.el_class, source_set = i.set,
-                                          source_start = i.el_start, source_end = i.el_end, source_strand = i.el_strand,
-                                          source_distance = i.dist)]
-  src[!is.na(source_element), source_chrom := src_chrom]
-  src[family == "L1" & (source_set == "reference") %in% TRUE,
-      source_full_length := (source_end - source_start) >= p_int(params$full_length_l1_bp)]
-  pv <- per_var[, .(variant_id, full_length, af)]
-  src[source_set == "cohort", `:=`(source_full_length = pv$full_length[match(source_element, pv$variant_id)],
-                                   source_af = pv$af[match(source_element, pv$variant_id)])]
-}
-src[, source_type := fifelse(is.na(source_set), NA_character_,
-                     fifelse(source_set == "reference", "fixed", "polymorphic"))]
-if (!is.null(p_str(params$genes)) && any(!is.na(src$src_chrom))) {
-  G <- read_elements(params$genes, "gene")
-  g <- G[src[!is.na(src_chrom)], on = .(chrom == src_chrom, start <= src_end, end >= src_start), nomatch = 0,
-         .(transduction, gene = name)][, .(overlapping_genes = paste(sort(unique(gene)), collapse = ",")), by = transduction]
-  src <- merge(src, g, by = "transduction", all.x = TRUE)
+young_repeats <- if (!is.null(rmsk)) merge_intervals(rmsk %>%
+  filter(is.na(div) | div < opt$repeat_max_div | stri_detect_regex(rclass, "Simple_repeat|Low_complexity|(^|/)Alu"))) else NULL
+all_repeats <- if (!is.null(rmsk)) merge_intervals(rmsk) else NULL
+known_source_paths <- Filter(nzchar, stri_split_fixed(params$known_sources, ",")[[1]])
+source_candidates <- bind_rows(c(if (!is.null(rmsk)) list(rmsk), map(known_source_paths, ~ read_elements(.x, basename(.x))),
+                                 list(cohort_elements)))
+message(sprintf("source candidates: %d reference, %d known_sources, %d cohort (polymorphic) insertion sites",
+                sum(source_candidates$set == "reference"), sum(!source_candidates$set %in% c("reference", "cohort")),
+                sum(source_candidates$set == "cohort")))
+FAMILY_RE <- c(Alu = "^SINE/Alu|(^|/)Alu", L1 = "^LINE/L1|(^|/)L1", SVA = "(^|/)SVA")
+source_candidates <- source_candidates %>% filter(set != "reference" | stri_detect_regex(rclass, "Alu|L1|SVA"))
+candidate_ends <- source_candidates %>%
+  transmute(chrom, pos = end, el_start = start, el_end = end, el_strand = strand, el_name = name, el_class = rclass, set)
+candidate_starts <- source_candidates %>%
+  transmute(chrom, pos = start, el_start = start, el_end = end, el_strand = strand, el_name = name, el_class = rclass, set)
+window <- opt$source_window
+tolerance <- opt$overlap_tolerance
+
+## hits: key, variant_id, family, kind, src_chrom, src_start, src_end, src_strand
+## -> the nearest qualifying element per key. A 3' transduction's source element
+## ends just UPSTREAM of the hit (in the hit's genomic orientation); a 5' one
+## starts just DOWNSTREAM.
+no_source <- tibble(key = character(), variant_id = character(), family = character(), need = character(),
+                    src_start = integer(), el_start = integer(), el_end = integer(), el_strand = character(),
+                    el_name = character(), el_class = character(), set = character(), dist = integer())
+nearest_source <- function(hits) {
+  if (!nrow(source_candidates) || !nrow(hits)) return(no_source)
+  hits <- hits %>%
+    mutate(upstream = (kind == "3p") == (src_strand == "+"),
+           need = if_else(src_strand == "+", "+", "-"),
+           lo = if_else(upstream, src_start - window, src_end - tolerance),
+           hi = if_else(upstream, src_start + tolerance, src_end + window))
+  bind_rows(
+    hits %>% filter(upstream) %>%
+      inner_join(candidate_ends, join_by(src_chrom == chrom, lo <= pos, hi >= pos)) %>%
+      mutate(dist = src_start - el_end),
+    hits %>% filter(!upstream) %>%
+      inner_join(candidate_starts, join_by(src_chrom == chrom, lo <= pos, hi >= pos)) %>%
+      mutate(dist = el_start - src_end)
+  ) %>%
+    select(key, variant_id, family, need, src_start, el_start, el_end, el_strand, el_name, el_class, set, dist) %>%
+    filter(el_strand == need | el_strand == ".", dist >= -tolerance, dist <= window,
+           !set %in% c("reference", "cohort") | stri_detect_regex(paste0(el_class, "/", el_name), FAMILY_RE[family]),
+           !(set == "cohort" & el_name == variant_id)) %>%
+    arrange(key, abs(dist), desc(el_end - el_start)) %>%
+    distinct(key, .keep_all = TRUE)
 }
 
-## group by source: assigned element, else mapped locus within cluster_window
-src[, source_locus := NA_character_]
-src[!is.na(source_element), source_locus := sprintf("%s:%d-%d(%s)", source_chrom, source_start, source_end, source_strand)]
-cw <- p_int(params$cluster_window)
-nl <- src[is.na(source_element) & !is.na(src_chrom)][order(src_chrom, src_start)]
-if (nrow(nl)) {
-  nl[, brk := c(TRUE, src_chrom[-1] != src_chrom[-.N] | src_start[-1] - cummax(src_end)[-.N] > cw)]
-  nl[, grp := cumsum(brk)][, locus := sprintf("%s:%d(no_element)", src_chrom[1], src_start[1]), by = grp]
-  src[nl, on = "transduction", source_locus := i.locus]
+assigned <- nearest_source(sources %>% filter(!is.na(src_chrom)) %>%
+                             transmute(key = transduction, variant_id, family, kind, src_chrom, src_start, src_end, src_strand))
+sources <- sources %>%
+  left_join(assigned %>% transmute(transduction = key, source_element = el_name, source_class = el_class, source_set = set,
+                                   source_start = el_start, source_end = el_end, source_strand = el_strand,
+                                   source_distance = as.integer(dist)), by = "transduction") %>%
+  mutate(source_element = as.character(source_element), source_class = as.character(source_class),
+         source_set = as.character(source_set), source_start = as.integer(source_start),
+         source_end = as.integer(source_end), source_strand = as.character(source_strand),
+         source_chrom = if_else(!is.na(source_element), src_chrom, NA_character_),
+         source_full_length = case_when(
+           family == "L1" & source_set %in% "reference" ~ (source_end - source_start) >= opt$full_length_l1_bp,
+           source_set %in% "cohort" ~ per_var$full_length[match(source_element, per_var$variant_id)],
+           TRUE ~ NA),
+         source_af = if_else(source_set %in% "cohort", per_var$af[match(source_element, per_var$variant_id)], NA_real_),
+         source_type = case_when(is.na(source_set) ~ NA_character_, source_set == "reference" ~ "fixed", TRUE ~ "polymorphic"))
+if (nzchar(params$genes) && any(!is.na(sources$src_chrom))) {
+  genes <- read_elements(params$genes, "gene")
+  sources <- sources %>%
+    left_join(sources %>% filter(!is.na(src_chrom)) %>%
+                inner_join(genes, join_by(src_chrom == chrom, src_end >= start, src_start <= end)) %>%
+                group_by(transduction) %>%
+                summarise(overlapping_genes = paste(sort(unique(name)), collapse = ",")), by = "transduction")
 }
-un <- src[mapping %in% c("unmapped", "self_only")]
-if (nrow(un) > 1 && p_bool(params$run_ava) && !is.null(which_tool("minimap2"))) {
-  ufa <- file.path(tempdir(), "unmapped_transductions.fa")
-  write_fasta(un$transduction, tseqs[un$transduction, on = "id", seq], ufa)
-  upaf <- file.path(tempdir(), "unmapped_ava.paf")
-  run_tool(which_tool("minimap2"), c("-c", "-x", params$minimap2_preset, "--secondary=yes", "-X", "-t", threads, ufa, ufa), stdout = upaf)
-  A <- read_paf(upaf)
-  if (nrow(A)) {
-    A <- A[qname != tname & alen > 0 & matches / alen >= p_num(params$min_identity) &
-             (qend - qstart) / pmin(qlen, tlen) >= p_num(params$min_qcov)]
-    nodes <- un$transduction
-    comp <- setNames(seq_along(nodes), nodes)
-    a <- match(A$qname, nodes); b <- match(A$tname, nodes)
+
+## Group by source: the assigned element, else mapped loci within cluster_window
+cluster_window <- opt$cluster_window
+sources <- sources %>%
+  mutate(source_locus = if_else(!is.na(source_element),
+                                sprintf("%s:%d-%d(%s)", source_chrom, source_start, source_end, source_strand), NA_character_))
+element_less <- sources %>%
+  filter(is.na(source_element), !is.na(src_chrom)) %>%
+  arrange(src_chrom, src_start) %>%
+  mutate(block = cumsum(c(TRUE, src_chrom[-1] != src_chrom[-n()] | src_start[-1] - cummax(src_end)[-n()] > cluster_window))) %>%
+  group_by(block) %>%
+  mutate(locus = sprintf("%s:%d(no_element)", src_chrom[1], src_start[1])) %>%
+  ungroup()
+sources <- sources %>%
+  left_join(element_less %>% select(transduction, locus), by = "transduction") %>%
+  mutate(source_locus = coalesce(source_locus, locus)) %>%
+  select(-locus)
+
+## Unmapped / self-only segments that recur: connected components of an
+## all-vs-all alignment are shared non-reference sources.
+unplaced <- sources %>% filter(mapping %in% c("unmapped", "self_only"))
+if (nrow(unplaced) > 1 && opt$run_ava && nzchar(Sys.which("minimap2"))) {
+  unplaced_fa <- file.path(tempdir(), "unmapped_transductions.fa")
+  writeLines(paste0(">", unplaced$transduction, "\n", transduced_seqs$seq[match(unplaced$transduction, transduced_seqs$id)]),
+             unplaced_fa)
+  ava_paf <- file.path(tempdir(), "unmapped_ava.paf")
+  status <- system2("minimap2", c("-c", "-x", params$minimap2_preset, "--secondary=yes", "-X", "-t", threads,
+                                  unplaced_fa, unplaced_fa), stdout = ava_paf, stderr = FALSE)
+  if (status != 0) stop("minimap2 failed (exit ", status, ")")
+  ava_hits <- read_paf(ava_paf)
+  if (nrow(ava_hits)) {
+    ava_hits <- ava_hits %>%
+      filter(qname != tname, alen > 0, matches / alen >= opt$min_identity,
+             (qend - qstart) / pmin(qlen, tlen) >= opt$min_qcov)
+    nodes <- unplaced$transduction
+    component <- setNames(seq_along(nodes), nodes)
+    from <- match(ava_hits$qname, nodes); to <- match(ava_hits$tname, nodes)
     repeat {   # label propagation to connected components
-      lab <- pmin(comp[a], comp[b])
-      upd <- data.table(n = c(a, b), l = c(lab, lab))[, .(l = min(l)), by = n]
-      new <- comp; new[upd$n] <- pmin(new[upd$n], upd$l)
-      if (identical(new, comp)) break
-      comp <- new
+      label <- pmin(component[from], component[to])
+      lowest <- tibble(node = c(from, to), label = c(label, label)) %>% group_by(node) %>% summarise(label = min(label))
+      updated <- component
+      updated[lowest$node] <- pmin(updated[lowest$node], lowest$label)
+      if (identical(updated, component)) break
+      component <- updated
     }
-    cs <- table(comp)
-    multi <- names(cs)[cs > 1]
-    if (length(multi)) {
-      ids <- match(as.character(comp), multi)
-      src[match(nodes[!is.na(ids)], transduction), source_locus := sprintf("nonref_cluster_%04d", ids[!is.na(ids)])]
+    sizes <- table(component)
+    shared <- names(sizes)[sizes > 1]
+    if (length(shared)) {
+      cluster <- match(as.character(component), shared)
+      in_cluster <- match(nodes[!is.na(cluster)], sources$transduction)
+      sources$source_locus[in_cluster] <- sprintf("nonref_cluster_%04d", cluster[!is.na(cluster)])
     }
   }
 }
+
 ## Segments with no reference locus (unmapped / self-only, including the
 ## non-reference clusters): is the sequence carried by some OTHER cohort
 ## insertion allele? Members of the segment's own non-reference cluster are
 ## excluded, since they share it by construction.
-src[, other_alleles := NA_character_]
-un <- src[mapping %in% c("unmapped", "self_only")]
-if (nrow(un) && !is.null(which_tool("minimap2"))) {
-  afa <- file.path(tempdir(), "cohort_alleles.fa")
-  write_fasta(paste(ins$variant_id, ins$id, sep = "|"), ins$seq, afa)
-  qfa <- file.path(tempdir(), "unplaced_segments.fa")
-  write_fasta(un$transduction, tseqs[un$transduction, on = "id", seq], qfa)
-  apaf <- file.path(tempdir(), "unplaced_vs_alleles.paf")
-  run_tool(which_tool("minimap2"), c("-c", "-x", params$minimap2_preset, "--secondary=yes", "-N", "50", "-t", threads,
-                                     afa, qfa), stdout = apaf)
-  B <- read_paf(apaf)
-  if (nrow(B)) {
-    B <- B[alen > 0 & matches / alen >= p_num(params$min_identity) & (qend - qstart) / qlen >= p_num(params$min_qcov)]
-    B[, hit_variant := sub("\\|[^|]*$", "", tname)]
-    B <- merge(B, src[, .(qname = transduction, variant_id, source_locus)], by = "qname")
-    mates <- src[stri_startswith_fixed(source_locus, "nonref_cluster") %in% TRUE, paste(source_locus, variant_id)]
-    B <- B[hit_variant != variant_id & !paste(source_locus, hit_variant) %in% mates]
-    if (nrow(B)) {
-      oa <- B[, .(other_alleles = paste(sort(unique(hit_variant)), collapse = ",")), by = qname]
-      src[oa, on = .(transduction = qname), other_alleles := i.other_alleles]
-    }
+sources$other_alleles <- NA_character_
+unplaced <- sources %>% filter(mapping %in% c("unmapped", "self_only"))
+if (nrow(unplaced) && nzchar(Sys.which("minimap2"))) {
+  alleles_fa <- file.path(tempdir(), "cohort_alleles.fa")
+  writeLines(paste0(">", insertions$variant_id, "|", insertions$id, "\n", insertions$seq), alleles_fa)
+  unplaced_fa <- file.path(tempdir(), "unplaced_segments.fa")
+  writeLines(paste0(">", unplaced$transduction, "\n", transduced_seqs$seq[match(unplaced$transduction, transduced_seqs$id)]),
+             unplaced_fa)
+  allele_paf <- file.path(tempdir(), "unplaced_vs_alleles.paf")
+  status <- system2("minimap2", c("-c", "-x", params$minimap2_preset, "--secondary=yes", "-N", "50", "-t", threads,
+                                  alleles_fa, unplaced_fa), stdout = allele_paf, stderr = FALSE)
+  if (status != 0) stop("minimap2 failed (exit ", status, ")")
+  allele_hits <- read_paf(allele_paf)
+  if (nrow(allele_hits)) {
+    cluster_mates <- sources %>%
+      filter(stri_startswith_fixed(source_locus, "nonref_cluster") %in% TRUE) %>%
+      transmute(mate = paste(source_locus, variant_id))
+    found_in <- allele_hits %>%
+      filter(alen > 0, matches / alen >= opt$min_identity, (qend - qstart) / qlen >= opt$min_qcov) %>%
+      mutate(hit_variant = sub("\\|[^|]*$", "", tname)) %>%
+      inner_join(sources %>% select(qname = transduction, variant_id, source_locus), by = "qname") %>%
+      filter(hit_variant != variant_id, !paste(source_locus, hit_variant) %in% cluster_mates$mate) %>%
+      group_by(qname) %>%
+      summarise(found = paste(sort(unique(hit_variant)), collapse = ","))
+    sources <- sources %>%
+      left_join(found_in, by = c("transduction" = "qname")) %>%
+      mutate(other_alleles = coalesce(found, other_alleles)) %>%
+      select(-found)
   }
 }
 
-## ---- Transduction segments ------------------------------------------------
+## ---- Transduction segments --------------------------------------------------------
 ## A source element can itself carry a transduction, so one transduced
 ## segment may hold sequence from several source loci ("concatenated"
 ## transductions, Kirby et al. 2025, Mobile DNA 16:42). Outward from the
@@ -978,128 +1187,192 @@ if (nrow(un) && !is.null(which_tool("minimap2"))) {
 ## aligns there (the immediate source is a reference element that still
 ## carries the inherited sequence, so the whole segment aligns to it; with
 ## several such generations the inherited pieces split off as a ladder); and
-## stretches >= min_transduction with no hit, left unaligned. Coordinates
-## a/b run outward from the element (0-based, half-open).
+## stretches >= min_segment with no hit, left unaligned. `inner`/`outer` run
+## outward from the element (0-based, half-open).
 
-chain_hits <- function(h, tol) {
-  h <- h[order(b)]
-  n <- nrow(h); sc <- numeric(n); bk <- integer(n)
-  for (i in seq_len(n)) {
-    j <- seq_len(i - 1L)
-    p <- j[h$b[j] - h$a[i] <= pmin(tol, (h$b[i] - h$a[i]) / 2, (h$b[j] - h$a[j]) / 2)]
-    k <- if (length(p)) p[which.max(sc[p])] else 0L
-    sc[i] <- h$w[i] + if (k) sc[k] else 0
-    bk[i] <- k
-  }
-  i <- which.max(sc); keep <- integer()
-  while (i > 0L) { keep <- c(i, keep); i <- bk[i] }
-  h[keep]
-}
-count_loci <- function(chrom, pos, lab) {
-  if (!length(chrom)) return(0L)
-  o <- order(chrom, pos); ch <- chrom[o]; ps <- pos[o]; lb <- lab[o]
-  1L + sum(ch[-1] != ch[-length(ch)] | (diff(ps) > cw & lb[-1] != lb[-length(lb)]))
-}
-
-transduction_segments <- function(Hp, meta, tseqs) {
-  lens <- meta[, .(qname = transduction, qlen = td_len, kind)]
-  segs <- data.table(qname = character(), a = integer(), b = integer(), status = character(), hit = integer())
-  if (nrow(Hp)) {
-    Hp <- merge(copy(Hp), meta[, .(qname = transduction, variant_id, family, kind)], by = "qname")
-    Hp[, hit := .I]
-    ps <- nearest_source(Hp[self_hit == FALSE, .(key = as.character(hit), variant_id, family, kind,
-                                                  src_chrom = tname, src_start = tstart, src_end = tend, src_strand = strand)])
-    Hp[, `:=`(source_element = NA_character_, source_set = NA_character_, source_start = NA_integer_,
-              source_end = NA_integer_, source_strand = NA_character_, source_distance = NA_integer_)]
-    if (nrow(ps)) Hp[ps[, .(hit = as.integer(key), el_name, set, el_start, el_end, el_strand, dist)], on = "hit",
-                     `:=`(source_element = i.el_name, source_set = i.set, source_start = i.el_start,
-                          source_end = i.el_end, source_strand = i.el_strand, source_distance = i.dist)]
-    Hp[, status := fifelse(self_hit, "insertion_site",
-                   fifelse(mapq >= p_int(params$min_mapq) | !is.na(source_element), "traced", "multi_mapping"))]
-    Hp[, `:=`(a = fifelse(kind == "3p", qstart, qlen - qend), b = fifelse(kind == "3p", qend, qlen - qstart))]
+transduction_segments <- function(piece_hits, transduction_meta, transduced_seqs) {
+  lengths_by_q <- transduction_meta %>% select(qname = transduction, qlen = td_len, kind)
+  segments <- tibble(qname = character(), inner = integer(), outer = integer(), status = character(), hit_id = integer())
+  if (nrow(piece_hits)) {
+    piece_hits <- piece_hits %>%
+      inner_join(transduction_meta %>% select(qname = transduction, variant_id, family, kind), by = "qname") %>%
+      arrange(qname) %>%
+      mutate(hit_id = row_number())
+    placed <- nearest_source(piece_hits %>% filter(!self_hit) %>%
+                               transmute(key = as.character(hit_id), variant_id, family, kind, src_chrom = tname,
+                                         src_start = tstart, src_end = tend, src_strand = strand))
+    piece_hits <- piece_hits %>%
+      left_join(placed %>% transmute(hit_id = as.integer(key), source_element = el_name, source_set = set,
+                                     source_start = el_start, source_end = el_end, source_strand = el_strand,
+                                     source_distance = as.integer(dist)), by = "hit_id") %>%
+      mutate(source_element = as.character(source_element), source_set = as.character(source_set),
+             source_start = as.integer(source_start), source_end = as.integer(source_end),
+             source_strand = as.character(source_strand),
+             status = case_when(self_hit ~ "insertion_site",
+                                mapq >= opt$min_mapq | !is.na(source_element) ~ "traced",
+                                TRUE ~ "multi_mapping"),
+             inner = if_else(kind == "3p", qstart, qlen - qend),
+             outer = if_else(kind == "3p", qend, qlen - qstart))
     ## a low-MAPQ hit placed only by a nearby element is a guess when an equally
     ## good hit covers the same stretch elsewhere: segmental duplications put
     ## identical flanks beside several elements
-    low <- Hp[status == "traced" & mapq < p_int(params$min_mapq), .(qname, hit, a, b, matches, tname, tstart)]
-    if (nrow(low)) {
-      rv <- merge(low, Hp[, .(qname, h2 = hit, a2 = a, b2 = b, m2 = matches, t2 = tname, s2 = tstart)],
-                  by = "qname", allow.cartesian = TRUE)
-      rv <- rv[h2 != hit & pmin(b, b2) - pmax(a, a2) >= 0.8 * pmax(b - a, b2 - a2) & m2 >= 0.95 * matches &
-                 (t2 != tname | abs(s2 - tstart) > cw)]
-      Hp[hit %in% rv$hit, status := "ambiguous_source"]
+    low_mapq <- piece_hits %>% filter(status == "traced", mapq < opt$min_mapq)
+    if (nrow(low_mapq)) {
+      tied <- low_mapq %>%
+        select(qname, hit_id, inner, outer, matches, tname, tstart) %>%
+        inner_join(piece_hits %>% select(qname, rival = hit_id, rival_inner = inner, rival_outer = outer,
+                                         rival_matches = matches, rival_chrom = tname, rival_start = tstart),
+                   by = "qname", relationship = "many-to-many") %>%
+        filter(rival != hit_id,
+               pmin(outer, rival_outer) - pmax(inner, rival_inner) >= 0.8 * pmax(outer - inner, rival_outer - rival_inner),
+               rival_matches >= 0.95 * matches,
+               rival_chrom != tname | abs(rival_start - tstart) > cluster_window)
+      piece_hits <- piece_hits %>% mutate(status = if_else(hit_id %in% tied$hit_id, "ambiguous_source", status))
     }
     ## genome-wide, minimap2 may not even report the rival copy; a low-MAPQ
     ## genome hit is kept only as a ladder rung (inside a longer hit from the
     ## same inner end), and anything else is left to the flank search, which
     ## sees every candidate copy
-    low <- Hp[status == "traced" & mapq < p_int(params$min_mapq) & method %in% "genome", .(qname, hit, a, b)]
-    if (nrow(low)) {
-      rung <- merge(low, Hp[, .(qname, h2 = hit, a2 = a, b2 = b)], by = "qname", allow.cartesian = TRUE)[
-        h2 != hit & abs(a2 - a) <= pmin(tol, 0.2 * (b - a)) & b2 >= b + P$min_seg, unique(hit)]
-      Hp[hit %in% setdiff(low$hit, rung), status := "ambiguous_source"]
+    low_mapq <- piece_hits %>% filter(status == "traced", mapq < opt$min_mapq, method %in% "genome")
+    if (nrow(low_mapq)) {
+      rungs <- low_mapq %>%
+        select(qname, hit_id, inner, outer) %>%
+        inner_join(piece_hits %>% select(qname, other = hit_id, other_inner = inner, other_outer = outer),
+                   by = "qname", relationship = "many-to-many") %>%
+        filter(other != hit_id, abs(other_inner - inner) <= pmin(tolerance, 0.2 * (outer - inner)),
+               other_outer >= outer + opt$min_segment)
+      piece_hits <- piece_hits %>%
+        mutate(status = if_else(hit_id %in% setdiff(low_mapq$hit_id, rungs$hit_id), "ambiguous_source", status))
     }
     ## mapping quality says nothing about a hit that is all repeat (an Alu
     ## fragment, SVA VNTR): it must hold min_segment bp of unique sequence
-    Hp[status == "traced", unique_bp := (tend - tstart) - repeat_bp(tname, tstart, tend)]
-    Hp[status == "traced" & unique_bp < P$min_seg, status := "repeat_only"]
-    Hp[, w := fifelse(status %in% c("multi_mapping", "ambiguous_source", "repeat_only"), 0.1, 1) * matches]
-    chain <- Hp[, chain_hits(.SD, tol), by = qname]
-    chain[, inherited_nested := FALSE]
-    nest <- merge(chain[, .(qname, c_hit = hit, c_a = a, c_b = b, c_chrom = tname, c_start = tstart)],
-                  Hp[status == "traced" & !is.na(source_element) & !hit %in% chain$hit], by = "qname", allow.cartesian = TRUE)
-    nest <- nest[abs(a - c_a) <= pmin(tol, 0.2 * (b - a)) & b <= c_b - P$min_seg & (tname != c_chrom | abs(tstart - c_start) > cw)]
+    repeat_overlap <- if (is.null(young_repeats)) tibble(hit_id = integer(), repeat_bp = numeric()) else
+      piece_hits %>%
+        filter(status == "traced") %>%
+        select(hit_id, tname, tstart, tend) %>%
+        inner_join(young_repeats, join_by(tname == chrom, tstart < end, tend > start)) %>%
+        group_by(hit_id) %>%
+        summarise(repeat_bp = as.numeric(sum(pmin(end, tend) - pmax(start, tstart))))
+    piece_hits <- piece_hits %>%
+      left_join(repeat_overlap, by = "hit_id") %>%
+      mutate(unique_bp = if_else(status == "traced", (tend - tstart) - coalesce(repeat_bp, 0), NA_real_),
+             status = if_else(status == "traced" & unique_bp < opt$min_segment, "repeat_only", status),
+             chain_weight = if_else(status %in% c("multi_mapping", "ambiguous_source", "repeat_only"), 0.1, 1) * matches)
+    ## best-scoring chain of query-disjoint hits per transduction (overlap
+    ## allowed up to min(tolerance, half the shorter hit))
+    chain <- piece_hits %>%
+      select(-repeat_bp) %>%
+      group_by(qname) %>%
+      group_modify(function(hits, key) {
+        hits <- hits %>% arrange(outer)
+        score <- numeric(nrow(hits)); previous <- integer(nrow(hits))
+        for (i in seq_len(nrow(hits))) {
+          earlier <- seq_len(i - 1L)
+          fits <- earlier[hits$outer[earlier] - hits$inner[i] <=
+                            pmin(tolerance, (hits$outer[i] - hits$inner[i]) / 2, (hits$outer[earlier] - hits$inner[earlier]) / 2)]
+          best <- if (length(fits)) fits[which.max(score[fits])] else 0L
+          score[i] <- hits$chain_weight[i] + if (best) score[best] else 0
+          previous[i] <- best
+        }
+        i <- which.max(score); keep <- integer()
+        while (i > 0L) { keep <- c(i, keep); i <- previous[i] }
+        hits[keep, ]
+      }) %>%
+      ungroup() %>%
+      mutate(inherited_nested = FALSE)
     ## each older source's copy ends further in than the next one's, so the
     ## hits form a ladder and each rung's outer end is a generation boundary
-    nest <- nest[order(c_hit, b, -matches)][, .SD[c(TRUE, diff(b) >= P$min_seg)], by = c_hit]
-    if (nrow(nest)) {
-      nest[, a := shift(b, fill = c_a[1]), by = c_hit]
-      chain[nest[, .(top = max(b)), by = c_hit], on = .(hit = c_hit), a := i.top]
+    nested <- chain %>%
+      select(qname, container = hit_id, container_inner = inner, container_outer = outer,
+             container_chrom = tname, container_start = tstart) %>%
+      inner_join(piece_hits %>% filter(status == "traced", !is.na(source_element), !hit_id %in% chain$hit_id),
+                 by = "qname", relationship = "many-to-many") %>%
+      filter(abs(inner - container_inner) <= pmin(tolerance, 0.2 * (outer - inner)),
+             outer <= container_outer - opt$min_segment,
+             tname != container_chrom | abs(tstart - container_start) > cluster_window) %>%
+      arrange(container, outer, desc(matches)) %>%
+      group_by(container) %>%
+      filter(c(TRUE, diff(outer) >= opt$min_segment)) %>%
+      mutate(inner = lag(outer, default = container_inner[1])) %>%
+      ungroup()
+    if (nrow(nested)) {
+      chain <- chain %>%
+        left_join(nested %>% group_by(container) %>% summarise(top = max(outer)), by = c("hit_id" = "container")) %>%
+        mutate(inner = coalesce(top, inner)) %>%
+        select(-top)
     }
-    nest[, inherited_nested := TRUE]
-    segs <- rbind(chain, nest[, !c("c_hit", "c_a", "c_b", "c_chrom", "c_start")], fill = TRUE)
-    segs <- segs[order(qname, a)][, a := pmax(a, shift(cummax(b), fill = 0L)), by = qname][b - a >= P$min_seg]
+    segments <- bind_rows(chain, nested %>% mutate(inherited_nested = TRUE) %>%
+                            select(-container, -container_inner, -container_outer, -container_chrom, -container_start)) %>%
+      arrange(qname, inner) %>%
+      group_by(qname) %>%
+      mutate(inner = pmax(inner, lag(cummax(outer), default = 0L))) %>%
+      ungroup() %>%
+      filter(outer - inner >= opt$min_segment)
   }
-  gaps <- merge(lens[, .(qname, qlen)], segs[, .(qname, a, b)], by = "qname", all.x = TRUE)[order(qname, a)]
-  gaps <- gaps[, .(a = c(0L, b[!is.na(b)]), b = c(a[!is.na(a)], qlen[1])), by = qname][b - a >= P$min_seg]
-  segs <- rbind(segs, gaps[, status := "unaligned"], fill = TRUE)
-  for (c in c("tname", "tstart", "tend", "strand", "mapq", "identity", "matches", "alen", "qstart", "qend",
-              "source_element", "source_set", "source_start", "source_end", "source_strand", "source_distance",
-              "inherited_nested", "method", "evalue")) if (!c %in% names(segs)) segs[, (c) := NA]
-  segs[, intersect(c("kind", "qlen", "variant_id", "family", "ins_chrom", "ins_pos"), names(segs)) := NULL]
-  segs <- merge(segs, merge(lens, meta[, .(qname = transduction, variant_id, family, ins_chrom, ins_pos)], by = "qname"),
-                by = "qname")
-  segs <- segs[order(qname, a)][, segment := seq_len(.N), by = qname]
-  segs[, `:=`(seg_start = fifelse(kind == "3p", a + 1L, qlen - b + 1L), seg_end = fifelse(kind == "3p", b, qlen - a))]
-  segs[, seg_len := seg_end - seg_start + 1L]
-  segs[, seg_seq := stri_sub(tseqs$seq[match(qname, tseqs$id)], seg_start, seg_end)]
-  segs[status == "unaligned" & stri_count_fixed(seg_seq, "A") / seg_len >= P$polya_frac, status := "polyA"]
-  segs[, source_locus := NA_character_]
-  segs[status == "traced", source_locus := fifelse(!is.na(source_element),
-         sprintf("%s:%d-%d(%s)", tname, source_start, source_end, source_strand), sprintf("%s:%d(no_element)", tname, tstart))]
-  segs[, source_type := fifelse(is.na(source_set), NA_character_, fifelse(source_set == "reference", "fixed", "polymorphic"))]
-  segs[is.na(inherited_nested), inherited_nested := FALSE]
-  if (nrow(Hp)) {
-    ov <- merge(segs[, .(qname, segment, sa = a, sb = b, hit)], Hp[, .(qname, h2 = hit, a, b)], by = "qname", allow.cartesian = TRUE)
-    ov <- ov[(is.na(hit) | h2 != hit) & (pmin(sb, b) - pmax(sa, a)) >= 0.5 * (sb - sa), .(n_other_hits = .N), by = .(qname, segment)]
-    segs[ov, on = .(qname, segment), n_other_hits := i.n_other_hits]
+  gaps <- lengths_by_q %>%
+    select(qname, qlen) %>%
+    left_join(segments %>% select(qname, inner, outer), by = "qname") %>%
+    arrange(qname, inner) %>%
+    group_by(qname) %>%
+    reframe(gap_inner = c(0L, outer[!is.na(outer)]), gap_outer = c(inner[!is.na(inner)], qlen[1])) %>%
+    transmute(qname, inner = gap_inner, outer = gap_outer, status = "unaligned") %>%
+    filter(outer - inner >= opt$min_segment)
+  segments <- bind_rows(segments, gaps)
+  for (column in c("tname", "tstart", "tend", "strand", "mapq", "identity", "matches", "alen", "qstart", "qend",
+                   "source_element", "source_set", "source_start", "source_end", "source_strand", "source_distance",
+                   "inherited_nested", "method", "evalue")) {
+    if (!column %in% names(segments)) segments[[column]] <- NA
   }
-  if (!"n_other_hits" %in% names(segs)) segs[, n_other_hits := NA_integer_]
-  segs[is.na(n_other_hits), n_other_hits := 0L]
+  segments <- segments %>%
+    select(-any_of(c("kind", "qlen", "variant_id", "family", "ins_chrom", "ins_pos"))) %>%
+    inner_join(lengths_by_q %>% inner_join(transduction_meta %>% select(qname = transduction, variant_id, family, ins_chrom, ins_pos),
+                                           by = "qname"), by = "qname") %>%
+    arrange(qname, inner) %>%
+    group_by(qname) %>%
+    mutate(segment = row_number()) %>%
+    ungroup() %>%
+    mutate(seg_start = if_else(kind == "3p", inner + 1L, qlen - outer + 1L),
+           seg_end = if_else(kind == "3p", outer, qlen - inner),
+           seg_len = seg_end - seg_start + 1L,
+           seg_seq = stri_sub(transduced_seqs$seq[match(qname, transduced_seqs$id)], seg_start, seg_end),
+           status = if_else(status == "unaligned" & stri_count_fixed(seg_seq, "A") / seg_len >= opt$polya_min_frac, "polyA", status),
+           source_locus = case_when(status != "traced" ~ NA_character_,
+                                    !is.na(source_element) ~ sprintf("%s:%d-%d(%s)", tname, source_start, source_end, source_strand),
+                                    TRUE ~ sprintf("%s:%d(no_element)", tname, tstart)),
+           source_type = case_when(is.na(source_set) ~ NA_character_, source_set == "reference" ~ "fixed", TRUE ~ "polymorphic"),
+           inherited_nested = coalesce(inherited_nested, FALSE))
+  segments$n_other_hits <- 0L
+  if (nrow(piece_hits)) {
+    overlapping <- segments %>%
+      select(qname, segment, seg_inner = inner, seg_outer = outer, hit_id) %>%
+      inner_join(piece_hits %>% select(qname, other = hit_id, inner, outer), by = "qname", relationship = "many-to-many") %>%
+      filter(is.na(hit_id) | other != hit_id,
+             pmin(seg_outer, outer) - pmax(seg_inner, inner) >= 0.5 * (seg_outer - seg_inner)) %>%
+      count(qname, segment, name = "n_other")
+    segments <- segments %>%
+      left_join(overlapping, by = c("qname", "segment")) %>%
+      mutate(n_other_hits = coalesce(n_other, 0L)) %>%
+      select(-n_other)
+  }
   ## 3': a parent's own poly(A) sits between its inherited sequence and its flank
-  segs[, outer_polyA := NA]
-  segs[kind == "3p", outer_polyA := vapply(seq_len(.N), function(i)
-    any(abs(td_tails[id == qname[i], s] - seg_end[i]) <= P$polya_gap), NA)]
-  segs
+  segments %>%
+    mutate(outer_polyA = if_else(kind == "3p",
+                                 map2_lgl(qname, seg_end, ~ any(abs(transduction_tails$s[transduction_tails$id == .x] - .y) <= opt$polya_gap)),
+                                 NA))
 }
 
-## Second pass: stretches too short or too repetitive to place genome-wide are
-## searched against the flanks of candidate source elements only, a library
-## small enough (~10-50 Mb) for a 20-30 bp match to be significant. Every
-## RefRmsk repeat in the library and every poly(A) run in the stretches is
-## hard-masked first (homopolymer runs of any base too, and BLAST's DUST filter
-## is on): in a small library a repeat fragment can have a single, meaningless
-## copy, and poly(A) linkers match A-rich flanks. A hit is kept
-## only without a near-tie at another locus, and must pass the same
+transduction_tails <- find_tails(transduced_seqs$id, transduced_seqs$seq, rep(0L, nrow(transduced_seqs)),
+                                 opt$min_polya, opt$polya_min_frac)
+segments <- transduction_segments(piece_hits, transduction_meta, transduced_seqs)
+
+## ---- Source tracing: second pass against source flanks --------------------------------
+## Stretches too short or too repetitive to place genome-wide are searched
+## against the flanks of candidate source elements only, a library small enough
+## (~10-50 Mb) for a 20-30 bp match to be significant. Every RefRmsk repeat in
+## the library and every homopolymer run in the stretches is hard-masked first
+## (and BLAST's DUST filter is on): in a small library a repeat fragment can
+## have a single, meaningless copy, and poly(A) linkers match A-rich flanks. A
+## hit is kept only without a near-tie at another locus, and must pass the same
 ## source-element rules as a genome hit.
 
 mask_n <- function(seqs, from, to) {
@@ -1109,161 +1382,222 @@ mask_n <- function(seqs, from, to) {
   seqs
 }
 
-pick_flank_hits <- function(qs, qe, bits, chrom, pos) {
-  keep <- integer()
-  for (i in seq_along(qs)) {
-    ov <- pmin(qe, qe[i]) - pmax(qs, qs[i]) + 1
-    rival <- ov >= 0.5 * (qe[i] - qs[i] + 1) & bits >= bits[i] - 2 & (chrom != chrom[i] | abs(pos - pos[i]) > qe[i] - qs[i] + 1)
-    taken <- length(keep) && any(pmin(qe[keep], qe[i]) - pmax(qs[keep], qs[i]) + 1 > tol)
-    if (!any(rival) && !taken) keep <- c(keep, i)
+## Each run of consecutive unplaced segments is one stretch, so a piece is never
+## cut short by a neighbouring junk hit.
+UNPLACED_STATUS <- c("unaligned", "multi_mapping", "ambiguous_source", "repeat_only", "polyA")
+stretches <- segments %>%
+  arrange(qname, seg_start) %>%
+  group_by(qname) %>%
+  mutate(run = cumsum(!status %in% UNPLACED_STATUS | c(TRUE, seg_start[-1] > seg_end[-n()] + 1L))) %>%
+  filter(status %in% UNPLACED_STATUS) %>%
+  group_by(qname, run) %>%
+  summarise(seg_start = min(seg_start), seg_end = max(seg_end), all_polyA = all(status == "polyA"),
+            qlen = qlen[1], variant_id = variant_id[1], family = family[1], kind = kind[1],
+            ins_chrom = ins_chrom[1], ins_pos = ins_pos[1], .groups = "drop") %>%
+  filter(!all_polyA) %>%
+  mutate(seg_seq = stri_sub(transduced_seqs$seq[match(qname, transduced_seqs$id)], seg_start, seg_end)) %>%
+  filter(seg_end - seg_start + 1L >= opt$min_segment)
+flank_hits <- tibble()
+search_families <- intersect(intersect(stri_split_fixed(params$flank_families, ",")[[1]], names(FAMILY_RE)),
+                             unique(stretches$family))
+if (opt$flank_search && nrow(stretches) && length(search_families)) {
+  class_name <- paste0(source_candidates$rclass, "/", source_candidates$name)
+  in_family <- Reduce(`|`, map(FAMILY_RE[search_families], ~ stri_detect_regex(class_name, .x)))
+  short_l1 <- source_candidates$set == "reference" & stri_detect_regex(class_name, FAMILY_RE[["L1"]]) &
+    (source_candidates$end - source_candidates$start) < opt$full_length_l1_bp
+  flank_sources <- source_candidates[(in_family | !source_candidates$set %in% c("reference", "cohort")) & !short_l1, ]
+
+  work_dir <- file.path(tempdir(), "flank_search"); dir.create(work_dir, showWarnings = FALSE)
+  fasta <- file.path(work_dir, "ref.fa")
+  if (!file.exists(fasta)) file.symlink(normalizePath(reference_fasta), fasta)
+  if (file.exists(paste0(reference_fasta, ".gzi")) && !file.exists(paste0(fasta, ".gzi"))) {
+    file.symlink(normalizePath(paste0(reference_fasta, ".gzi")), paste0(fasta, ".gzi"))
   }
-  keep
-}
-
-flank_search <- function(segs) {
-  none <- data.table()
-  ## each run of consecutive unplaced segments is one stretch, so a piece is
-  ## never cut short by a neighbouring junk hit
-  open_st <- c("unaligned", "multi_mapping", "ambiguous_source", "repeat_only", "polyA")
-  q <- segs[order(qname, seg_start)][, run := cumsum(!status %in% open_st | c(TRUE, seg_start[-1] > seg_end[-.N] + 1L)), by = qname][
-    status %in% open_st, .(seg_start = min(seg_start), seg_end = max(seg_end), all_polyA = all(status == "polyA"),
-                            qlen = qlen[1], variant_id = variant_id[1], family = family[1], kind = kind[1],
-                            ins_chrom = ins_chrom[1], ins_pos = ins_pos[1]), by = .(qname, run)][all_polyA == FALSE]
-  q[, seg_seq := stri_sub(tseqs$seq[match(qname, tseqs$id)], seg_start, seg_end)]
-  q <- q[seg_end - seg_start + 1L >= P$min_seg]
-  if (!p_bool(params$flank_search) || !nrow(q)) return(none)
-  st <- which_tool("samtools"); mkdb <- which_tool("makeblastdb"); bn <- which_tool("blastn")
-  fams <- intersect(intersect(stri_split_fixed(params$flank_families, ",")[[1]], names(FAM_RE)), unique(q$family))
-  if (!length(fams)) return(none)
-  lab <- paste0(E$rclass, "/", E$name)
-  in_fam <- Reduce(`|`, lapply(FAM_RE[fams], function(r) stri_detect_regex(lab, r)))
-  short_l1 <- E$set == "reference" & stri_detect_regex(lab, FAM_RE[["L1"]]) & (E$end - E$start) < p_int(params$full_length_l1_bp)
-  C <- E[(in_fam | !E$set %in% c("reference", "cohort")) & !short_l1]
-
-  td <- file.path(tempdir(), "flank_search"); dir.create(td, showWarnings = FALSE)
-  fa <- file.path(td, "ref.fa")
-  if (!file.exists(fa)) file.symlink(normalizePath(ref_fa), fa)
-  if (file.exists(paste0(ref_fa, ".gzi")) && !file.exists(paste0(fa, ".gzi"))) file.symlink(normalizePath(paste0(ref_fa, ".gzi")), paste0(fa, ".gzi"))
-  fai <- p_str(params$reference_fasta_index)
-  if (is.null(fai) && file.exists(paste0(ref_fa, ".fai"))) fai <- paste0(ref_fa, ".fai")
-  if (is.null(fai)) run_tool(st, c("faidx", fa)) else if (!file.exists(paste0(fa, ".fai"))) file.symlink(normalizePath(fai), paste0(fa, ".fai"))
-  len <- fread(paste0(fa, ".fai"), header = FALSE, select = 1:2, col.names = c("chrom", "len"))
-
-  R <- rbind(C[, .(chrom, s = start - win, e = start)], C[, .(chrom, s = end, e = end + win)])
-  R <- len[R, on = "chrom", nomatch = 0][, `:=`(s = pmax(0, s), e = pmin(len, e))][e > s]
-  R <- R[order(chrom, s)][, grp := cumsum(c(TRUE, s[-1] > cummax(e)[-.N])), by = chrom][
-    , .(s = min(s), e = max(e)), by = .(chrom, grp)][, rid := paste0("r", .I)]
-  writeLines(sprintf("%s:%.0f-%.0f", R$chrom, R$s + 1, R$e), file.path(td, "regions.txt"))
-  run_tool(st, c("faidx", fa, "-r", file.path(td, "regions.txt")), stdout = file.path(td, "flanks_raw.fa"))
-  fseq <- read_fasta(file.path(td, "flanks_raw.fa"))$seq
-  if (!is.null(RM_ALL)) {
-    M <- RM_ALL[, .(chrom, ms = start, me = end)]
-    M <- M[R[, .(rid, chrom, s, e, ri = .I)], on = .(chrom, me > s, ms < e), nomatch = 0,
-           .(ri, from = as.integer(pmax(x.ms, i.s) - i.s + 1), to = as.integer(pmin(x.me, i.e) - i.s))]
-    M <- M[to >= from][order(ri, from)][, grp := cumsum(from > shift(cummax(to), fill = -1L)), by = ri][
-      , .(from = min(from), to = max(to)), by = .(ri, grp)]
-    idx <- split(M, factor(M$ri, levels = seq_len(nrow(R))))
-    fseq <- mask_n(fseq, lapply(idx, `[[`, "from"), lapply(idx, `[[`, "to"))
+  fai <- if (nzchar(params$reference_fasta_index)) params$reference_fasta_index else
+    if (file.exists(paste0(reference_fasta, ".fai"))) paste0(reference_fasta, ".fai") else ""
+  if (!nzchar(fai)) {
+    if (system2("samtools", c("faidx", fasta)) != 0) stop("samtools faidx failed")
+  } else if (!file.exists(paste0(fasta, ".fai"))) {
+    file.symlink(normalizePath(fai), paste0(fasta, ".fai"))
   }
-  LOG("source-flank search: %.0f%% of the flank library repeat-masked", 100 * sum(stri_count_fixed(fseq, "N")) / sum(nchar(fseq)))
-  write_fasta(R$rid, fseq, file.path(td, "flanks.fa"))
-  run_tool(mkdb, c("-in", file.path(td, "flanks.fa"), "-dbtype", "nucl", "-out", file.path(td, "flanks")), stdout = FALSE)
+  contig_lengths <- read_tsv(paste0(fasta, ".fai"), col_names = FALSE,
+                             col_types = cols_only(X1 = col_character(), X2 = col_integer()), progress = FALSE) %>%
+    rename(chrom = X1, len = X2)
 
-  q[, qid := paste0("q", .I)]
-  pa <- stri_locate_all_regex(q$seg_seq, sprintf("A{%1$d,}|C{%1$d,}|G{%1$d,}|T{%1$d,}", P$min_polya), omit_no_match = TRUE)
-  q[, qseq := mask_n(seg_seq, lapply(pa, function(m) m[, 1]), lapply(pa, function(m) m[, 2]))]
-  write_fasta(q$qid, q$qseq, file.path(td, "stretches.fa"))
-  bout <- file.path(td, "stretches.blast.tsv")
-  run_tool(bn, c("-task", "blastn-short", "-query", file.path(td, "stretches.fa"), "-db", file.path(td, "flanks"),
-                 "-evalue", params$flank_max_evalue, "-dust", "yes", "-max_target_seqs", "50", "-num_threads", threads,
-                 "-outfmt", shQuote("6 qseqid sseqid pident length qstart qend sstart send evalue bitscore nident"),
-                 "-out", bout))
-  B <- if (file.size(bout) > 0) fread(bout, header = FALSE, col.names = c("qid", "rid", "pident", "length", "qs", "qe",
-                                                                          "ss", "se", "evalue", "bitscore", "nident")) else data.table()
-  LOG("source-flank search: %d untraced stretches against %d flank regions (%.1f Mb) of %d candidate sources",
-      nrow(q), nrow(R), sum(R$e - R$s) / 1e6, nrow(C))
-  if (!nrow(B)) return(none)
-  B <- B[pident / 100 >= p_num(params$min_identity) & length >= P$min_seg]
-  B <- merge(B, R[, .(rid, chrom, rs = s)], by = "rid")
-  B[, `:=`(strand = fifelse(ss <= se, "+", "-"), tstart = as.integer(rs + pmin(ss, se) - 1), tend = as.integer(rs + pmax(ss, se)))]
-  ## a stretch can hold several pieces, so every query-disjoint hit is kept,
-  ## best first, unless a near-tie covering the same piece lands anywhere else
-  ## (another element, or a second spot in the same flank: a tandem repeat)
-  B <- B[order(qid, -bitscore)][, .SD[pick_flank_hits(qs, qe, bitscore, chrom, tstart)], by = qid]
-  B <- merge(B, q[, .(qid, qname, qlen, seg_start, variant_id, family, kind, ins_chrom, ins_pos)], by = "qid")
-  hits <- B[, .(qname, qlen, qstart = seg_start - 1L + qs - 1L, qend = seg_start - 1L + qe, strand, tname = chrom,
+  flank_regions <- bind_rows(flank_sources %>% transmute(chrom, s = start - window, e = start),
+                             flank_sources %>% transmute(chrom, s = end, e = end + window)) %>%
+    inner_join(contig_lengths, by = "chrom") %>%
+    mutate(s = pmax(0, s), e = pmin(len, e)) %>%
+    filter(e > s) %>%
+    arrange(chrom, s) %>%
+    group_by(chrom) %>%
+    mutate(block = cumsum(c(TRUE, s[-1] > cummax(e)[-n()]))) %>%
+    group_by(chrom, block) %>%
+    summarise(s = min(s), e = max(e), .groups = "drop") %>%
+    mutate(rid = paste0("r", row_number()), ri = row_number())
+  writeLines(sprintf("%s:%.0f-%.0f", flank_regions$chrom, flank_regions$s + 1, flank_regions$e), file.path(work_dir, "regions.txt"))
+  if (system2("samtools", c("faidx", fasta, "-r", file.path(work_dir, "regions.txt")),
+              stdout = file.path(work_dir, "flanks_raw.fa")) != 0) stop("samtools faidx failed")
+  flank_seqs <- read_fasta(file.path(work_dir, "flanks_raw.fa"))$seq
+  if (!is.null(all_repeats)) {
+    masked <- flank_regions %>%
+      select(ri, chrom, s, e) %>%
+      inner_join(all_repeats, join_by(chrom, s < end, e > start)) %>%
+      transmute(ri, from = as.integer(pmax(start, s) - s + 1), to = as.integer(pmin(end, e) - s)) %>%
+      filter(to >= from) %>%
+      arrange(ri, from) %>%
+      group_by(ri) %>%
+      mutate(block = cumsum(from > lag(cummax(to), default = -1L))) %>%
+      group_by(ri, block) %>%
+      summarise(from = min(from), to = max(to), .groups = "drop")
+    by_region <- split(masked, factor(masked$ri, levels = seq_len(nrow(flank_regions))))
+    flank_seqs <- mask_n(flank_seqs, map(by_region, "from"), map(by_region, "to"))
+  }
+  message(sprintf("source-flank search: %.0f%% of the flank library repeat-masked",
+                  100 * sum(stri_count_fixed(flank_seqs, "N")) / sum(nchar(flank_seqs))))
+  writeLines(paste0(">", flank_regions$rid, "\n", flank_seqs), file.path(work_dir, "flanks.fa"))
+  if (system2("makeblastdb", c("-in", file.path(work_dir, "flanks.fa"), "-dbtype", "nucl", "-out", file.path(work_dir, "flanks")),
+              stdout = FALSE) != 0) stop("makeblastdb failed")
+
+  stretches <- stretches %>% mutate(qid = paste0("q", row_number()))
+  homopolymers <- stri_locate_all_regex(stretches$seg_seq, sprintf("A{%1$d,}|C{%1$d,}|G{%1$d,}|T{%1$d,}", opt$min_polya),
+                                        omit_no_match = TRUE)
+  stretches$query_seq <- mask_n(stretches$seg_seq, map(homopolymers, ~ .x[, 1]), map(homopolymers, ~ .x[, 2]))
+  writeLines(paste0(">", stretches$qid, "\n", stretches$query_seq), file.path(work_dir, "stretches.fa"))
+  blast_out <- file.path(work_dir, "stretches.blast.tsv")
+  if (system2("blastn", c("-task", "blastn-short", "-query", file.path(work_dir, "stretches.fa"), "-db", file.path(work_dir, "flanks"),
+                          "-evalue", params$flank_max_evalue, "-dust", "yes", "-max_target_seqs", "50", "-num_threads", threads,
+                          "-outfmt", shQuote("6 qseqid sseqid pident length qstart qend sstart send evalue bitscore nident"),
+                          "-out", blast_out)) != 0) stop("blastn failed")
+  blast_hits <- if (file.size(blast_out) > 0) {
+    read_tsv(blast_out, col_names = c("qid", "rid", "pident", "length", "qs", "qe", "ss", "se", "evalue", "bitscore", "nident"),
+             col_types = "ccdiiiiiddi", progress = FALSE)
+  } else tibble()
+  message(sprintf("source-flank search: %d untraced stretches against %d flank regions (%.1f Mb) of %d candidate sources",
+                  nrow(stretches), nrow(flank_regions), sum(flank_regions$e - flank_regions$s) / 1e6, nrow(flank_sources)))
+  if (nrow(blast_hits)) {
+    ## A stretch can hold several pieces, so every query-disjoint hit is kept,
+    ## best first, unless a near-tie covering the same piece lands anywhere else
+    ## (another element, or a second spot in the same flank: a tandem repeat).
+    flank_hits <- blast_hits %>%
+      filter(pident / 100 >= opt$min_identity, length >= opt$min_segment) %>%
+      inner_join(flank_regions %>% select(rid, chrom, region_start = s), by = "rid") %>%
+      mutate(strand = if_else(ss <= se, "+", "-"),
+             tstart = as.integer(region_start + pmin(ss, se) - 1),
+             tend = as.integer(region_start + pmax(ss, se))) %>%
+      arrange(rid) %>%
+      arrange(qid, desc(bitscore)) %>%
+      group_by(qid) %>%
+      group_modify(function(hits, key) {
+        keep <- integer()
+        for (i in seq_len(nrow(hits))) {
+          overlap <- pmin(hits$qe, hits$qe[i]) - pmax(hits$qs, hits$qs[i]) + 1
+          rival <- overlap >= 0.5 * (hits$qe[i] - hits$qs[i] + 1) & hits$bitscore >= hits$bitscore[i] - 2 &
+            (hits$chrom != hits$chrom[i] | abs(hits$tstart - hits$tstart[i]) > hits$qe[i] - hits$qs[i] + 1)
+          taken <- length(keep) && any(pmin(hits$qe[keep], hits$qe[i]) - pmax(hits$qs[keep], hits$qs[i]) + 1 > tolerance)
+          if (!any(rival) && !taken) keep <- c(keep, i)
+        }
+        hits[keep, ]
+      }) %>%
+      ungroup() %>%
+      inner_join(stretches %>% select(qid, qname, qlen, seg_start, variant_id, family, kind, ins_chrom, ins_pos), by = "qid") %>%
+      transmute(qname, qlen, qstart = seg_start - 1L + qs - 1L, qend = seg_start - 1L + qe, strand, tname = chrom,
                 tstart, tend, matches = nident, alen = length, mapq = 0L, primary = TRUE, identity = pident / 100,
-                ins_chrom, ins_pos, method = "source_flank", evalue, variant_id, family, kind)]
-  sw <- p_int(params$self_window)
-  hits[, self_hit := tname == ins_chrom & !is.na(ins_pos) & (abs(tstart - ins_pos) < sw | abs(tend - ins_pos) < sw)]
-  hits[, k := as.character(.I)]
-  ps <- nearest_source(hits[self_hit == FALSE, .(key = k, variant_id, family, kind, src_chrom = tname,
-                                                 src_start = tstart, src_end = tend, src_strand = strand)])
-  hits <- hits[self_hit | k %in% ps$key]
-  LOG("source-flank search: %d stretches placed (%d beside a source element, %d at the insertion's own site)",
-      nrow(hits), hits[self_hit == FALSE, .N], hits[self_hit == TRUE, .N])
-  hits[, c("k", "variant_id", "family", "kind") := NULL]
-  hits
+                ins_chrom, ins_pos, method = "source_flank", evalue, variant_id, family, kind) %>%
+      mutate(self_hit = tname == ins_chrom & !is.na(ins_pos) &
+               (abs(tstart - ins_pos) < opt$self_window | abs(tend - ins_pos) < opt$self_window),
+             key = as.character(row_number()))
+    placed <- nearest_source(flank_hits %>% filter(!self_hit) %>%
+                               transmute(key, variant_id, family, kind, src_chrom = tname, src_start = tstart,
+                                         src_end = tend, src_strand = strand))
+    flank_hits <- flank_hits %>% filter(self_hit | key %in% placed$key)
+    message(sprintf("source-flank search: %d stretches placed (%d beside a source element, %d at the insertion's own site)",
+                    nrow(flank_hits), sum(!flank_hits$self_hit), sum(flank_hits$self_hit)))
+    flank_hits <- flank_hits %>% select(-key, -variant_id, -family, -kind)
+  }
 }
+if (nrow(flank_hits)) segments <- transduction_segments(bind_rows(piece_hits, flank_hits), transduction_meta, transduced_seqs)
 
-td_tails <- find_tails(tseqs$id, tseqs$seq, rep(0L, nrow(tseqs)), P$min_polya, P$polya_frac)
-segs <- transduction_segments(Hp, meta, tseqs)
-flank_hits <- flank_search(segs)
-if (nrow(flank_hits)) segs <- transduction_segments(rbind(Hp, flank_hits, fill = TRUE), meta, tseqs)
-td_tab <- segs[order(qname, segment), .(
-  n_segments = .N,
-  segments = paste(sprintf("%d:%d-%d", segment, seg_start, seg_end), collapse = ";"),
-  segment_sources = paste(fifelse(status == "traced", source_locus, status), collapse = ";"),
-  n_source_loci = count_loci(tname[status == "traced"], tstart[status == "traced"], source_locus[status == "traced"]),
-  traced_bp = sum(seg_len[status == "traced"]),
-  untraced_bp = sum(seg_len[status %in% c("unaligned", "multi_mapping", "ambiguous_source", "repeat_only")]),
-  n_flank_placed = sum(status == "traced" & method %in% "source_flank"),
-  has_insertion_site = any(status == "insertion_site"),
-  has_inherited_nested = any(inherited_nested),
-  outer_polyA_breaks = sum(outer_polyA[segment < .N] %in% TRUE)), by = qname]
-td_tab[, flag := fcase(n_source_loci >= 2L, "concatenated",
-                       n_source_loci == 1L & untraced_bp == 0L, "single_source",
-                       n_source_loci == 1L, "single_source_partial",
-                       has_insertion_site, "insertion_site_only",
-                       default = "untraced")]
-td_tab <- merge(meta[, .(transduction, variant_id, kind, family, ins_chrom, ins_pos, td_len)],
-                td_tab[, transduction := qname][, qname := NULL], by = "transduction")
-td_tab[, sequence := tseqs$seq[match(transduction, tseqs$id)]]
-td_tab[, internal_polyA_runs := fifelse(kind == "3p", td_tails[, .N, by = id][td_tab, on = .(id = transduction), N], NA_integer_)]
-td_tab[kind == "3p" & is.na(internal_polyA_runs), internal_polyA_runs := 0L]
-save_tab(td_tab[, .(variant_id, kind, family, ins_chrom, ins_pos, td_len, flag, n_segments, n_source_loci, segments,
-                    segment_sources, traced_bp, untraced_bp, n_flank_placed, has_inherited_nested, outer_polyA_breaks,
-                    internal_polyA_runs, sequence)], "transductions")
-save_tab(segs[order(variant_id, kind, segment), .(
-  variant_id, kind, family, ins_chrom, ins_pos, segment, status, inherited_nested, seg_start, seg_end, seg_len,
-  chrom = tname, t_start = tstart, t_end = tend, strand, mapq, identity, matches, aligned_bp = alen,
-  hit_q_start = qstart + 1L, hit_q_end = qend, method, evalue, n_other_hits, source_element, source_type, source_locus,
-  source_distance, outer_polyA, seg_seq)], "transduction_segments")
-LOG("transductions: %s", paste(sprintf("%s %d", names(table(td_tab$flag)), table(td_tab$flag)), collapse = ", "))
+## ---- Transduction tables --------------------------------------------------------------
 
-src[, outcome := mapping]
-src[source_type == "fixed", outcome := "assigned_fixed"]
-src[source_type == "polymorphic", outcome := "assigned_polymorphic"]
-src[stri_startswith_fixed(source_locus, "nonref_cluster") %in% TRUE, outcome := "shared_unmapped"]
-save_tab(src, "transduction_sources")
+## Distinct loci among traced sub-segments: a new locus wherever the
+## chromosome changes or two placements are cluster_window apart with
+## different source loci.
+source_loci <- segments %>%
+  filter(status == "traced") %>%
+  arrange(qname, tname, tstart) %>%
+  group_by(qname) %>%
+  summarise(n_source_loci = 1L + sum(tname != lag(tname) |
+                                       (tstart - lag(tstart) > cluster_window & source_locus != lag(source_locus)), na.rm = TRUE))
+UNTRACED_STATUS <- c("unaligned", "multi_mapping", "ambiguous_source", "repeat_only")
+transductions <- segments %>%
+  arrange(qname, segment) %>%
+  group_by(qname) %>%
+  summarise(n_segments = n(),
+            segments = paste(sprintf("%d:%d-%d", segment, seg_start, seg_end), collapse = ";"),
+            segment_sources = paste(if_else(status == "traced", source_locus, status), collapse = ";"),
+            traced_bp = sum(seg_len[status == "traced"]),
+            untraced_bp = sum(seg_len[status %in% UNTRACED_STATUS]),
+            n_flank_placed = sum(status == "traced" & method %in% "source_flank"),
+            has_insertion_site = any(status == "insertion_site"),
+            has_inherited_nested = any(inherited_nested),
+            outer_polyA_breaks = sum(outer_polyA[segment < n()] %in% TRUE)) %>%
+  left_join(source_loci, by = "qname") %>%
+  mutate(n_source_loci = coalesce(n_source_loci, 0L),
+         flag = case_when(n_source_loci >= 2L ~ "concatenated",
+                          n_source_loci == 1L & untraced_bp == 0L ~ "single_source",
+                          n_source_loci == 1L ~ "single_source_partial",
+                          has_insertion_site ~ "insertion_site_only",
+                          TRUE ~ "untraced")) %>%
+  inner_join(transduction_meta %>% select(qname = transduction, variant_id, kind, family, ins_chrom, ins_pos, td_len), by = "qname") %>%
+  left_join(transduction_tails %>% count(id, name = "tail_runs"), by = c("qname" = "id")) %>%
+  mutate(sequence = transduced_seqs$seq[match(qname, transduced_seqs$id)],
+         internal_polyA_runs = if_else(kind == "3p", coalesce(tail_runs, 0L), NA_integer_)) %>%
+  arrange(qname)
+write_tsv(transductions %>%
+            select(variant_id, kind, family, ins_chrom, ins_pos, td_len, flag, n_segments, n_source_loci, segments,
+                   segment_sources, traced_bp, untraced_bp, n_flank_placed, has_inherited_nested, outer_polyA_breaks,
+                   internal_polyA_runs, sequence),
+          out_file("transductions.tsv"), na = "NA")
+message("wrote ", out_file("transductions.tsv"), " (", nrow(transductions), " rows)")
+write_tsv(segments %>%
+            arrange(variant_id, kind, segment) %>%
+            transmute(variant_id, kind, family, ins_chrom, ins_pos, segment, status, inherited_nested, seg_start, seg_end, seg_len,
+                      chrom = tname, t_start = tstart, t_end = tend, strand, mapq, identity, matches, aligned_bp = alen,
+                      hit_q_start = qstart + 1L, hit_q_end = qend, method, evalue, n_other_hits, source_element, source_type,
+                      source_locus, source_distance, outer_polyA, seg_seq),
+          out_file("transduction_segments.tsv"), na = "NA")
+message("wrote ", out_file("transduction_segments.tsv"), " (", nrow(segments), " rows)")
+message("transductions: ", paste(sprintf("%s %d", names(table(transductions$flag)), table(transductions$flag)), collapse = ", "))
 
-split_csv <- function(x) unique(unlist(strsplit(x[!is.na(x)], ",", fixed = TRUE)))
-srcsum <- src[!is.na(source_locus), .(
-  n_offspring = uniqueN(variant_id), kinds = paste(sort(unique(kind)), collapse = ","),
-  families = paste(sort(unique(family)), collapse = ","), source_element = source_element[1],
-  source_type = source_type[1], source_af = source_af[1], source_full_length = source_full_length[1],
-  median_td_len = as.numeric(median(td_len)), offspring_chroms = paste(sort(unique(ins_chrom)), collapse = ","),
-  offspring_span_bp = if (uniqueN(ins_chrom) == 1) as.numeric(diff(range(ins_pos))) else NA_real_,
-  other_alleles = paste(sort(split_csv(other_alleles)), collapse = ",")),
-  by = source_locus][order(-n_offspring)]
-srcsum[other_alleles == "", other_alleles := NA_character_]
+sources <- sources %>%
+  mutate(outcome = case_when(stri_startswith_fixed(source_locus, "nonref_cluster") %in% TRUE ~ "shared_unmapped",
+                             source_type %in% "fixed" ~ "assigned_fixed",
+                             source_type %in% "polymorphic" ~ "assigned_polymorphic",
+                             TRUE ~ mapping))
+write_tsv(sources, out_file("transduction_sources.tsv"), na = "NA")
+message("wrote ", out_file("transduction_sources.tsv"), " (", nrow(sources), " rows)")
+
 ## A non-reference cluster whose offspring all sit at one site is more likely a
 ## single polymorphic site split across variant ids than a shared source.
-srcsum[, same_site := fifelse(stri_startswith_fixed(source_locus, "nonref_cluster"),
-                              !is.na(offspring_span_bp) & offspring_span_bp <= cw, NA)]
-save_tab(srcsum, "source_summary")
-nrc <- srcsum[stri_startswith_fixed(source_locus, "nonref_cluster")]
-LOG("sources: %d fixed, %d polymorphic, %d mapped loci without an element; %d non-reference clusters (%d at a single site, %d found in other cohort alleles)",
-    srcsum[source_type == "fixed", .N], srcsum[source_type == "polymorphic", .N],
-    srcsum[is.na(source_type) & !stri_startswith_fixed(source_locus, "nonref_cluster"), .N],
-    nrow(nrc), nrc[same_site == TRUE, .N], nrc[!is.na(other_alleles), .N])
+source_summary <- sources %>%
+  filter(!is.na(source_locus)) %>%
+  group_by(source_locus) %>%
+  summarise(n_offspring = n_distinct(variant_id), kinds = paste(sort(unique(kind)), collapse = ","),
+            families = paste(sort(unique(family)), collapse = ","), source_element = source_element[1],
+            source_type = source_type[1], source_af = source_af[1], source_full_length = source_full_length[1],
+            median_td_len = as.numeric(median(td_len)), offspring_chroms = paste(sort(unique(ins_chrom)), collapse = ","),
+            offspring_span_bp = if (n_distinct(ins_chrom) == 1) as.numeric(diff(range(ins_pos))) else NA_real_,
+            other_alleles = paste(sort(unique(unlist(strsplit(other_alleles[!is.na(other_alleles)], ",", fixed = TRUE)))),
+                                  collapse = ",")) %>%
+  mutate(other_alleles = na_if(other_alleles, ""),
+         same_site = if_else(stri_startswith_fixed(source_locus, "nonref_cluster"),
+                             !is.na(offspring_span_bp) & offspring_span_bp <= cluster_window, NA)) %>%
+  arrange(desc(n_offspring))
+write_tsv(source_summary, out_file("source_summary.tsv"), na = "NA")
+message("wrote ", out_file("source_summary.tsv"), " (", nrow(source_summary), " rows)")
+nonref_clusters <- source_summary %>% filter(stri_startswith_fixed(source_locus, "nonref_cluster"))
+message(sprintf("sources: %d fixed, %d polymorphic, %d mapped loci without an element; %d non-reference clusters (%d at a single site, %d found in other cohort alleles)",
+                sum(source_summary$source_type %in% "fixed"), sum(source_summary$source_type %in% "polymorphic"),
+                sum(is.na(source_summary$source_type) & !stri_startswith_fixed(source_summary$source_locus, "nonref_cluster")),
+                nrow(nonref_clusters), sum(nonref_clusters$same_site %in% TRUE), sum(!is.na(nonref_clusters$other_alleles))))

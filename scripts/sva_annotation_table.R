@@ -1616,7 +1616,9 @@ cat(sprintf("Genotypes: %d SVAs, %d individuals (AN autosomes %d, chrX %s); %d o
 ## the modal structure and majority flags, each variant weighted by the
 ## haplotypes carrying it (as the catalog rolls sequences up). structure_group
 ## takes transduction first, because a transduced element can also be
-## full-length or truncated.
+## full-length or truncated. catalog_subfamily is the weighted modal catalog
+## subfamily: the catalog recognises SVA_F1 by its MAST2 exon 1, which the MEI
+## bed's labels (RepeatMasker has no F1 consensus) call SVA_F or SVA_E.
 catalog_structure <- function(path, mei_bed) {
   flag_cols <- c("full_length", "five_prime_truncated", "three_prime_truncated",
                  "three_prime_transduction", "five_prime_transduction")
@@ -1625,6 +1627,7 @@ catalog_structure <- function(path, mei_bed) {
   if (length(miss)) stop(path, ": not a structure_per_variant table, missing ", paste(miss, collapse = ", "))
   if ("family" %in% names(pv)) pv <- pv %>% filter(toupper(family) == "SVA")
   if (!"allele_count" %in% names(pv)) pv$allele_count <- 1
+  if (!"subfamily" %in% names(pv)) pv$subfamily <- NA_character_
   pv <- pv %>% mutate(variant_id = as.character(variant_id), across(all_of(flag_cols), as.logical))
 
   b <- fread_any(mei_bed, sep = "\t", header = FALSE, showProgress = FALSE)
@@ -1667,6 +1670,7 @@ catalog_structure <- function(path, mei_bed) {
     group_by(sva_id) %>%
     mutate(w = if (sum(w) > 0) w else rep(1, n())) %>%   # nothing carried: equal weights
     summarise(structure = names(which.max(tapply(w, coalesce(structure, "NA"), sum))),
+              catalog_subfamily = names(which.max(tapply(w, coalesce(subfamily, "NA"), sum))),
               is_full_length = majority(full_length, w),
               is_truncated = majority(five_prime_truncated | three_prime_truncated, w),
               has_transduction = majority(three_prime_transduction | five_prime_transduction, w),
@@ -1685,6 +1689,8 @@ if (!is.null(IN$catalog)) {
   cat(sprintf("Structural class for %d of %d %s SVAs:\n",
               sum(S$class == PL & S$name %in% struct$sva_id), sum(S$class == PL), PL))
   show_tab(struct %>% filter(sva_id %in% S$name) %>% count(structure_group, sort = TRUE))
+  cat(sprintf("%d %s SVAs relabelled SVA_F1 from the catalog (MAST2 exon 1 at the 5' end).\n",
+              sum(S$name %in% struct$sva_id[struct$catalog_subfamily %in% "SVA_F1"]), PL))
 } else {
   cat("No --catalog-per-variant: the structure columns are left out.\n")
 }
@@ -1696,10 +1702,11 @@ LOG("per-SVA table")
 ## in the bundle.
 ann_values <- as_tibble(element_annotations(anns, S$g, genome, S$strand, S$half))
 ann_names <- names(ann_values)
-STRUCT_COLS <- c("structure", "is_full_length", "is_truncated", "has_transduction", "n_catalog_variants", "structure_group")
+STRUCT_COLS <- c("structure", "is_full_length", "is_truncated", "has_transduction", "n_catalog_variants", "structure_group",
+                 "catalog_subfamily")
 LENGTH_COLS <- intersect(c("n_obs", "n_indiv", "n_alleles", "ins_length", "n_hexamer", "n_VNTR", LENGTH_STATS), names(S))
 LINK_COLS <- c("n_linked_genes", "linked_genes", "nearest_linked_gene_distance")
-clash <- intersect(ann_names, c("sva_id", "chrom", "start", "end", "strand", "subfamily", "class", "is_polymorphic",
+clash <- intersect(ann_names, c("sva_id", "chrom", "start", "end", "strand", "subfamily", "subfamily_mei", "class", "is_polymorphic",
                                 "is_singleton", "ac", "an", "af", "width", STRUCT_COLS, LENGTH_COLS, LINK_COLS))
 names(ann_values) <- ifelse(ann_names %in% clash, paste0("ann_", ann_names), ann_names)
 
@@ -1713,6 +1720,9 @@ tab <- S %>%
 if (!is.null(struct)) {
   tab <- tab %>%
     left_join(struct, by = "sva_id") %>%
+    mutate(subfamily_mei = subfamily,
+           subfamily = if_else(catalog_subfamily %in% "SVA_F1", "SVA_F1", subfamily)) %>%
+    relocate(subfamily_mei, .after = subfamily) %>%
     relocate(all_of(STRUCT_COLS), .after = width)
 }
 if (!is.null(links) && nrow(links)) {
