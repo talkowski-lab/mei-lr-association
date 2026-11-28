@@ -8,7 +8,7 @@ library(argparser)
 # Parse arguments
 argv <- arg_parser("Process reference SVAs to incorporate filters and export MED data") %>%
   add_argument("--ref-sva-length-table", "table with reference SVA lengths") %>%
-  add_argument("--ref-sva-lps-table", "table with reference SVA longest purse segment lenghts") %>%
+  add_argument("--ref-sva-repeat-summary-table", "repeat summary table from ParseLongestPureSegment (longest pure segment lengths, purity, homogeneity, entropy)") %>%
   add_argument("--ref-sva-flag-table", "table with SVA reference flags") %>%
   add_argument("--ref-sva-bed", "bed file with locations of reference SVAs") %>%
   add_argument("--sv-vcf", "URI of vcf with SVs (importantly deletions)") %>%
@@ -18,6 +18,7 @@ argv <- arg_parser("Process reference SVAs to incorporate filters and export MED
 
 # Import data
 ref_sva_length_df_raw <- read_delim(argv$ref_sva_length_table) %>%
+  select(sva_id, hap, indiv, length_hexamer, length_VNTR) %>%
   mutate(indiv = as.character(indiv))
 
 
@@ -28,9 +29,11 @@ ref_sva_length_df <- ref_sva_length_df_raw %>%
   mutate(length_hexamer = if_else(length_hexamer < 10, 0, length_hexamer)) %>%
   mutate(length_VNTR = if_else(length_VNTR < 40, 0, length_VNTR))
 
-ref_sva_length_lps_df <- read_delim(argv$ref_sva_lps_table) %>%
-  select(-starts_with("motif")) %>%
-  mutate(indiv = as.character(indiv)) 
+ref_sva_repeat_summary <- read_delim(argv$ref_sva_repeat_summary_table) %>%
+  mutate(indiv = as.character(indiv))
+
+ref_sva_length_lps_df <- ref_sva_repeat_summary %>%
+  select(indiv, hap, sva_id, starts_with("length_lps_"))
 
 # Per-haplotype QC flag -> single per-(indiv, sva_id, hap) pass/fail call.
 # "Missing" (no assembly coverage, so N%/skip% couldn't even be computed) is
@@ -44,13 +47,6 @@ ref_sva_flags <- read_delim(argv$ref_sva_flag_table) %>%
     if_all(ends_with("flag"), ~ .x == "Ok") ~ "Ok",
     .default="Fail"
   ))
-
-# Save filtered ref_sva_lengths
-ref_sva_length_df %>% 
-  left_join(ref_sva_flags) %>%
-  filter(filter %in% c("Ok", "Missing")) %>%
-  select(colnames(ref_sva_length_df)) %>%
-  write_tsv("ref_SVA_length_filtered.txt.gz")
 
 ref_sva_flags_h1 <- ref_sva_flags %>% filter(hap == "h1")
 ref_sva_flags_h2 <- ref_sva_flags %>% filter(hap == "h2")
@@ -132,6 +128,18 @@ sva_med <- intact_mei_med %>%
   group_by(sva_id) %>%
   filter(diff_len == min(diff_len))
 
+# Reference SVAs matched to a deletion call are polymorphic (rMEI); the rest
+# are fixed. The filtered per-haplotype tables are written once per class.
+rmei_sva_ids <- unique(sva_med$sva_id)
+
+ref_sva_length_filtered <- ref_sva_length_df %>%
+  left_join(ref_sva_flags) %>%
+  filter(filter %in% c("Ok", "Missing")) %>%
+  select(colnames(ref_sva_length_df))
+
+ref_sva_length_filtered %>% filter(sva_id %in% rmei_sva_ids) %>% write_tsv("rMEI_SVA_length_filtered.txt.gz")
+ref_sva_length_filtered %>% filter(!sva_id %in% rmei_sva_ids) %>% write_tsv("fixed_SVA_length_filtered.txt.gz")
+
 med_regions <- paste(paste(sva_med$CHROM, sva_med$POS, sep=":"), collapse=",")
 
 
@@ -150,6 +158,7 @@ med_gt_tidy <- read_delim("sva_del_gt.txt")
 
 colnames(med_gt_tidy) <- c("CHROM", "POS", "ID", "indiv", "GT")
 med_gt_tidy <- med_gt_tidy %>%
+  mutate(indiv = as.character(indiv)) %>%
   mutate(nGT = case_when(
     GT %in% c("1|1", "1/1") ~ 2,
     GT %in% c("1|0", "0|1", "1") ~ 1,
@@ -306,4 +315,16 @@ ref_sva_lps_perindiv_mat <- ref_sva_lps_perindiv %>%
 
 ref_sva_lps_perindiv_mat %>%
   write_tsv("ref_SVA_length_lps_perindiv_matrix.bed.gz")
+
+
+# Per-haplotype repeat summary (ParseLongestPureSegment), filtered like the
+# lengths. Assembled haplotypes with no repeat units have no row in the
+# summary, so their counts are 0.
+ref_sva_repeat_summary_byhap <- ref_sva_length_filtered %>%
+  select(indiv, hap, sva_id) %>%
+  left_join(ref_sva_repeat_summary, by = c("indiv", "hap", "sva_id")) %>%
+  mutate(across(matches("^(length_lps|n_units)_"), ~ replace_na(.x, 0)))
+
+ref_sva_repeat_summary_byhap %>% filter(sva_id %in% rmei_sva_ids) %>% write_tsv("rMEI_SVA_repeat_summary_filtered.txt.gz")
+ref_sva_repeat_summary_byhap %>% filter(!sva_id %in% rmei_sva_ids) %>% write_tsv("fixed_SVA_repeat_summary_filtered.txt.gz")
 

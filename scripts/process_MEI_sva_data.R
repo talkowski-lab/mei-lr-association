@@ -15,7 +15,7 @@ library(argparser)
 argv <- arg_parser("Combine reference and non-reference MEI SVA length data into per-individual matrices") %>%
   add_argument("--nrMEI-gt-table", help = "Clustered non-reference MEI genotype/length table (output of cluster_mei_gt.R)") %>%
   add_argument("--nrMEI-sva-length", help = "Per-nrMEI SVA repeat length table (hexamer/VNTR), keyed by fasta header") %>%
-  add_argument("--nrMEI-sva-length-lps", help = "Per-nrMEI SVA longest-pure-segment (LPS) length table, keyed by fasta header") %>%
+  add_argument("--nrMEI-sva-repeat-summary", help = "Per-nrMEI SVA repeat summary table (ParseLongestPureSegment: longest pure segment lengths, purity, homogeneity, entropy), keyed by fasta header") %>%
   add_argument("--rMEI-sva-length-indiv", help = "Per-individual reference MEI SVA repeat length table") %>%
   add_argument("--rMEI-sva-length-lps-indiv", help = "Per-individual reference MEI SVA LPS length table") %>%
   add_argument("--refSVA-length-table", help = "Reference SVA repeat length table (tidy, per haplotype)") %>%
@@ -25,18 +25,20 @@ argv <- arg_parser("Combine reference and non-reference MEI SVA length data into
   add_argument("--min-hexamer-length", help = "Hexamer repeat lengths below this are treated as absent (set to 0)", default = 10) %>%
   add_argument("--min-vntr-length", help = "VNTR repeat lengths below this are treated as absent (set to 0)", default = 40) %>%
   add_argument("--common-af-threshold", help = "Minimum allele frequency for an SVA to be included in the per-individual matrices", default = 0.001) %>%
+  add_argument("--rMEI-sva-repeat-summary", help = "Per-haplotype rMEI SVA repeat summary table (process_ref_sva_data.R's rMEI_SVA_repeat_summary_filtered) (optional)", default = NA) %>%
   parse_args()
 
 
 ## ---- Load inputs ----------------------------------------------------------
 
 nrMEI_gt_tidy <- read_delim(argv$nrMEI_gt_table) %>%
+  mutate(indiv = as.character(indiv)) %>%
   mutate(sva_id = paste0("SVA_MEI_cl", sprintf("%05d", cluster_id)))
 
 nrMEI_sva_lengths <- read_delim(argv$nrMEI_sva_length) %>%
   dplyr::rename(fastaheader = ID)
 
-nrMEI_sva_length_lps <- read_delim(argv$nrMEI_sva_length_lps) %>%
+nrMEI_repeat_summary <- read_delim(argv$nrMEI_sva_repeat_summary) %>%
   dplyr::rename(fastaheader = ID)
 
 rMEI_length_by_indiv <- read_delim(argv$rMEI_sva_length_indiv) %>%
@@ -63,7 +65,7 @@ nrMEI_gt_tidy <- nrMEI_gt_tidy %>%
 
 nrMEI_gt_lps_tidy <- nrMEI_gt_tidy %>%
   select(-length_hexamer, -length_VNTR) %>%
-  left_join(nrMEI_sva_length_lps %>% select(-starts_with("motif")))
+  left_join(nrMEI_repeat_summary %>% select(fastaheader, starts_with("length_lps_")), by = "fastaheader")
 
 nrMEI_gt_byhap <- bind_rows(
   nrMEI_gt_tidy %>% filter(hap1) %>% mutate(hap = "h1") %>% select(indiv, hap, CHROM, POS, sva_id, length_hexamer, length_VNTR),
@@ -391,3 +393,33 @@ MEI_length_lps_indiv_mat %>%
 
 MEI_deviance_lps_indiv_mat %>%
   write_tsv("mei_SVA_deviance_lps_perindiv_matrix.bed.gz")
+
+
+## ---- Combined ref + non-ref tidy repeat summary (ParseLongestPureSegment) --
+## Per haplotype, same individuals as the tidy length table.
+
+nrMEI_repeat_summary_tidy <- nrMEI_gt_tidy %>%
+  mutate(fastaheader = as.character(fastaheader)) %>%
+  select(indiv, sva_id, fastaheader, hap1, hap2) %>%
+  left_join(nrMEI_repeat_summary, by = "fastaheader")
+
+nrMEI_repeat_summary_byhap <- bind_rows(
+  nrMEI_repeat_summary_tidy %>% filter(hap1) %>% mutate(hap = "h1"),
+  nrMEI_repeat_summary_tidy %>% filter(hap2) %>% mutate(hap = "h2")
+) %>%
+  select(indiv, hap, sva_id, everything(), -fastaheader, -hap1, -hap2) %>%
+  mutate(across(matches("^(length_lps|n_units)_"), ~ replace_na(.x, 0)))
+
+rMEI_repeat_summary_byhap <- NULL
+if (!is.na(argv$rMEI_sva_repeat_summary)) {
+  rMEI_repeat_summary_byhap <- read_delim(argv$rMEI_sva_repeat_summary) %>%
+    mutate(indiv = as.character(indiv)) %>%
+    semi_join(
+      rMEI_length_by_indiv %>% filter(filter_GT),
+      by = c("indiv", "sva_id")
+    )
+}
+
+bind_rows(rMEI_repeat_summary_byhap, nrMEI_repeat_summary_byhap) %>%
+  arrange(sva_id) %>%
+  write_tsv("SVA_MEI_repeat_summary_tidy.txt.gz")

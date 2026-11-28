@@ -3,18 +3,23 @@ version 1.0
 ## Combines non-reference (nrMEI) and reference (rMEI) SVA repeat-length data
 ## into a tidy per-haplotype length table plus per-individual length and
 ## deviance-from-mean matrices (raw and longest-pure-segment/LPS-adjusted).
-## Driven by scripts/process_MEI_sva_data.R; nrMEIGtTable is expected to be
-## the clustered GT table produced by cluster_mei_gt.R.
+## NrMEISvaRepeatSummary (ParseLongestPureSegment output for the nrMEI
+## sequences) supplies the nrMEI LPS lengths; together with the optional
+## RMEISvaRepeatSummary (ProcessRefSVAData's rMEISVARepeatSummaryFiltered) it
+## is also written as a tidy per-haplotype repeat summary table. Driven by
+## scripts/process_MEI_sva_data.R; nrMEIGtTable is expected to be the
+## clustered GT table produced by cluster_mei_gt.R.
 
 workflow ProcessMEISVAData {
     input {
         File NrMEIGtTable
         File NrMEISvaLength
-        File NrMEISvaLengthLps
+        File NrMEISvaRepeatSummary
         File RMEISvaLengthIndiv
         File RMEISvaLengthLpsIndiv
         File RefSVALengthTable
         File RefSVABed
+        File? RMEISvaRepeatSummary
         String ImageTag = "latest"
     }
 
@@ -22,11 +27,12 @@ workflow ProcessMEISVAData {
         input:
             NrMEIGtTable = NrMEIGtTable,
             NrMEISvaLength = NrMEISvaLength,
-            NrMEISvaLengthLps = NrMEISvaLengthLps,
+            NrMEISvaRepeatSummary = NrMEISvaRepeatSummary,
             RMEISvaLengthIndiv = RMEISvaLengthIndiv,
             RMEISvaLengthLpsIndiv = RMEISvaLengthLpsIndiv,
             RefSVALengthTable = RefSVALengthTable,
             RefSVABed = RefSVABed,
+            RMEISvaRepeatSummary = RMEISvaRepeatSummary,
             ImageTag = ImageTag
     }
 
@@ -36,6 +42,7 @@ workflow ProcessMEISVAData {
         File MEIDeviancePerIndivMatrix = ProcessMEISVADataTask.MEIDeviancePerIndivMatrix
         File MEILengthLpsPerIndivMatrix = ProcessMEISVADataTask.MEILengthLpsPerIndivMatrix
         File MEIDevianceLpsPerIndivMatrix = ProcessMEISVADataTask.MEIDevianceLpsPerIndivMatrix
+        File MEIRepeatSummaryTidy = ProcessMEISVADataTask.MEIRepeatSummaryTidy
     }
 }
 
@@ -43,17 +50,18 @@ task ProcessMEISVADataTask {
     input {
         File NrMEIGtTable
         File NrMEISvaLength
-        File NrMEISvaLengthLps
+        File NrMEISvaRepeatSummary
         File RMEISvaLengthIndiv
         File RMEISvaLengthLpsIndiv
         File RefSVALengthTable
         File RefSVABed
+        File? RMEISvaRepeatSummary
         String ImageTag = "latest"
         Int MemoryGB = 8
         Int? DiskGB
     }
 
-    Int auto_disk_size = ceil(size([NrMEIGtTable, NrMEISvaLength, NrMEISvaLengthLps, RMEISvaLengthIndiv, RMEISvaLengthLpsIndiv, RefSVALengthTable, RefSVABed], "GB") * 2) + 10
+    Int auto_disk_size = ceil((size([NrMEIGtTable, NrMEISvaLength, NrMEISvaRepeatSummary, RMEISvaLengthIndiv, RMEISvaLengthLpsIndiv, RefSVALengthTable, RefSVABed], "GB") + size(RMEISvaRepeatSummary, "GB")) * 2) + 10
 
     command <<<
         set -euo pipefail
@@ -61,11 +69,12 @@ task ProcessMEISVADataTask {
         Rscript /scripts/process_MEI_sva_data.R \
             --nrMEI-gt-table ~{NrMEIGtTable} \
             --nrMEI-sva-length ~{NrMEISvaLength} \
-            --nrMEI-sva-length-lps ~{NrMEISvaLengthLps} \
+            --nrMEI-sva-repeat-summary ~{NrMEISvaRepeatSummary} \
             --rMEI-sva-length-indiv ~{RMEISvaLengthIndiv} \
             --rMEI-sva-length-lps-indiv ~{RMEISvaLengthLpsIndiv} \
             --refSVA-length-table ~{RefSVALengthTable} \
-            --refSVA-bed ~{RefSVABed} 
+            --refSVA-bed ~{RefSVABed} \
+            ~{"--rMEI-sva-repeat-summary " + RMEISvaRepeatSummary}
     >>>
 
     runtime {
@@ -83,5 +92,6 @@ task ProcessMEISVADataTask {
         File MEIDeviancePerIndivMatrix = "mei_SVA_deviance_perindiv_matrix.bed.gz"
         File MEILengthLpsPerIndivMatrix = "mei_SVA_length_lps_perindiv_matrix.bed.gz"
         File MEIDevianceLpsPerIndivMatrix = "mei_SVA_deviance_lps_perindiv_matrix.bed.gz"
+        File MEIRepeatSummaryTidy = "SVA_MEI_repeat_summary_tidy.txt.gz"
     }
 }
