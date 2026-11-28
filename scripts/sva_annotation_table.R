@@ -6,6 +6,10 @@
 ##
 ## Outputs (<outdir>/<prefix>.*):
 ##   sva_annotation_table.tsv.gz  one row per SVA
+##   alu_annotation_table.tsv.gz  one row per polymorphic Alu insertion, the same
+##                                columns as the SVA table minus the repeat lengths
+##   l1_annotation_table.tsv.gz   the same for polymorphic L1 insertions (each only
+##                                when its bed and genotype table resolve)
 ##   sva_annotations.rds          the annotation objects, the functions that look
 ##                                them up, genome, excluded/included regions,
 ##                                SVA-gene links and genes. The notebook's
@@ -18,7 +22,8 @@
 ##   2. Annotation library (LIB) -- saved into the bundle for the notebook
 ##   3. Self-checks of the library
 ##   4. Inputs (local, URL, gs:// or relative to --gcloud-bucket)
-##   5. SVA table: loci, class, subfamily, orientation, repeat lengths
+##   5. SVA table: loci, class, subfamily, orientation, repeat lengths; and the
+##      polymorphic Alu / L1 insertions, collapsed the same way
 ##   6. Gene-derived tracks (bedtools)
 ##   7. Replication timing and fork-directionality tracks
 ##   8. Annotations
@@ -56,6 +61,16 @@ ARGS <- list(
   sample_metadata = c("gs://prod-drc-broad/longreads/demo_group/lrWGS.phase2.sample.final_set.2025-05-27.tsv",
                       "Sample metadata (participant, sex) for chrX/chrY allele numbers and sex filtering"),
   catalog_per_variant = c("", "MEIStructuralCatalog <prefix>.structure_per_variant.tsv: structural class per SVA"),
+  ## polymorphic Alu / L1, same layouts as --mei-bed / --genotype-table
+  ## (the files notebooks/mei_sva_internal_var.Rmd and sva_methyl_analysis.Rmd read)
+  alu_bed = c("scratch/yulia/l1meaid_intactmei_annotations.bcftoolsmerge.wholegenome.phaseII.FILTERED.ori_intact_anno.ALU.clustered.bed",
+              "Clustered polymorphic Alu BED (same 12 columns as --mei-bed)"),
+  alu_genotype_table = c("submissions/58e986ab-5cbb-494b-ae6e-d7331d0eb4f4/FilterMEIVCF/1a2a317e-02f4-4675-8bdd-3d88de16fdc4/call-GzipGTClustered/ALU_gt_tidy_clustered.txt.gz",
+                         "FilterMEIVCF's tidy clustered Alu genotypes"),
+  l1_bed = c("scratch/yulia/l1meaid_intactmei_annotations.bcftoolsmerge.wholegenome.phaseII.FILTERED.ori_intact_anno.LINE.clustered.bed",
+             "Clustered polymorphic L1 BED (same 12 columns as --mei-bed)"),
+  l1_genotype_table = c("submissions/58e986ab-5cbb-494b-ae6e-d7331d0eb4f4/FilterMEIVCF/ab2ab051-f9b9-4fba-854e-ef5aa5231fa0/call-GzipGTClustered/LINE_gt_tidy_clustered.txt.gz",
+                        "FilterMEIVCF's tidy clustered L1 genotypes"),
   ## reference genome and gene annotation (public copies used if missing from --ref-folder)
   genome = c("hg38.chrom.sizes", "Chromosome sizes"),
   reference = c("hg38.fa", "Reference FASTA for GC (or give --gc-bedgraph)"),
@@ -846,6 +861,22 @@ IN <- list(
   include_bed     = fetch(params$include_bed, "include_bed"),
   rfd             = as_bedgraph(fetch(params$rfd_bedgraph, "rfd_bedgraph"), "rfd")
 )
+## The other polymorphic MEI families, each with its own element ids (as the
+## notebooks name them) and the names its insertions carry in the structural
+## catalog's `family` column.
+OTHER_FAMILIES <- list(
+  Alu = list(bed = fetch(params$alu_bed, "alu_bed"), genotype_table = fetch(params$alu_genotype_table, "alu_genotype_table"),
+             id_fmt = "Alu_MEI_cl%05d", catalog_families = "ALU"),
+  L1 = list(bed = fetch(params$l1_bed, "l1_bed"), genotype_table = fetch(params$l1_genotype_table, "l1_genotype_table"),
+            id_fmt = "LINE1_MEI_cl%05d", catalog_families = c("L1", "LINE1", "LINE"))
+)
+for (fam in names(OTHER_FAMILIES)) {
+  f <- OTHER_FAMILIES[[fam]]
+  if (xor(is.null(f$bed), is.null(f$genotype_table))) {
+    cat(sprintf("WARNING: %s needs both its bed and its genotype table; it is skipped.\n", fam))
+  }
+}
+OTHER_FAMILIES <- Filter(function(f) !is.null(f$bed) && !is.null(f$genotype_table), OTHER_FAMILIES)
 ## Extra categorical (BED, level in column 4) and numeric (bedGraph) tracks,
 ## given as name=path pairs.
 IN$category <- Filter(Negate(is.null), lapply(p_map(params$category_annotations), fetch, what = "category annotation"))
@@ -925,11 +956,13 @@ length_stats <- function(path, min_obs) {
   s
 }
 
-## Polymorphic SVAs: one locus per cluster (chrom, min start, max end), the
-## majority subfamily (clusters without a > subfamily_majority majority are
-## dropped, the notebook's ambig_subfamily filter) and the majority orientation
-## ("NONE" stays NA; a tie goes to the orientation listed first).
-read_mei_svas <- function(path, lengths) {
+## Polymorphic insertions of one family: one locus per cluster (chrom, min
+## start, max end), the majority subfamily (clusters without a >
+## subfamily_majority majority are dropped, the notebook's ambig_subfamily
+## filter) and the majority orientation ("NONE" stays NA; a tie goes to the
+## orientation listed first). `lengths` (SVA only) adds the repeat lengths, and
+## only the SVA call feeds the element funnel.
+read_mei_svas <- function(path, lengths = NULL, id_fmt = "SVA_MEI_cl%05d") {
   b <- fread_any(path, sep = "\t", header = FALSE, showProgress = FALSE)
   if (ncol(b) < length(MEI_COLS)) {
     stop(path, ": expected ", length(MEI_COLS), " columns (", paste(MEI_COLS, collapse = ", "), "), found ", ncol(b))
@@ -938,7 +971,7 @@ read_mei_svas <- function(path, lengths) {
   b <- as_tibble(b) %>%
     mutate(chrom = as.character(chrom), cluster_id = as.integer(cluster_id), row = row_number()) %>%
     filter(!is.na(cluster_id)) %>%
-    mutate(sva_id = sprintf("SVA_MEI_cl%05d", cluster_id))
+    mutate(sva_id = sprintf(id_fmt, cluster_id))
 
   loci <- b %>%
     group_by(cluster_id, sva_id) %>%
@@ -971,6 +1004,7 @@ read_mei_svas <- function(path, lengths) {
     left_join(subfamily, by = "cluster_id") %>%
     left_join(orientation, by = "cluster_id") %>%
     mutate(class = PL)
+  if (is.null(lengths)) return(svas)
   funnel(svas, "1. read from its input file")
   funnel(svas, "2. region parsed to coordinates")
   svas <- svas %>% left_join(lengths, by = "sva_id")
@@ -1057,7 +1091,16 @@ S <- bind_rows(read_mei_svas(IN$mei_bed, mei_len), read_ref_svas(IN$ref_table, r
   arrange(chrom, start) %>%
   select(any_of(KEEP))
 
-genome <- read_genome(IN$genome, keep_chroms = unique(S$chrom))
+## polymorphic Alu / L1, collapsed like the SVAs; `family` names the family
+OTHER <- bind_rows(lapply(names(OTHER_FAMILIES), function(fam) {
+  cat(sprintf("%s: ", fam))
+  read_mei_svas(OTHER_FAMILIES[[fam]]$bed, id_fmt = OTHER_FAMILIES[[fam]]$id_fmt) %>%
+    rename(name = sva_id) %>%
+    filter(!is.na(chrom), !is.na(start), !is.na(end)) %>%
+    mutate(family = fam, start = as.integer(start), end = as.integer(end))
+}))
+
+genome <- read_genome(IN$genome, keep_chroms = unique(c(S$chrom, OTHER$chrom)))
 ## A naming mismatch ("1" vs "chr1") would silently remove a whole class.
 lost <- S %>% filter(!chrom %in% genome$chrom) %>% count(class)
 for (i in seq_len(nrow(lost))) {
@@ -1083,6 +1126,17 @@ show_tab(S %>% group_by(class) %>%
            summarise(n = n(), median_width = as.numeric(median(width)), max_width = max(width),
                      pct_pointlike = round(100 * mean(width <= 1), 1)),
          caption = "Interval conventions by class (point-like = width <= 1 bp)")
+if (nrow(OTHER)) {
+  OTHER <- OTHER %>%
+    filter(chrom %in% genome$chrom) %>%
+    mutate(strand = if_else(orientation %in% c("+", "-"), orientation, NA_character_),
+           width = pmax(0, as.numeric(end) - as.numeric(start)),
+           point = if (params$point_mode == "start") as.numeric(start) else floor((as.numeric(start) + as.numeric(end)) / 2),
+           half = width / 2,
+           g = gpos(genome, chrom, point)) %>%
+    arrange(chrom, start)
+  show_tab(count(OTHER, family), caption = "Polymorphic Alu / L1 insertions on the genome's chromosomes")
+}
 
 ## ==== 6. Gene-derived tracks (bedtools) =============================================
 ## Gene context, gene deserts, strand-aware introns and SVA-gene links, all from
@@ -1183,7 +1237,7 @@ if (!is.null(IN$gencode_gtf)) {
   ## would print a round one as "2e+06", which bedtools rejects.
   writeLines(genome$chrom, work_file("chroms.txt"))
   write_tsv(genome[, .(chrom, size = sprintf("%.0f", size))], work_file("genome.txt"), col.names = FALSE)
-  write_tsv(S %>% select(chrom, start, end, name) %>% arrange(chrom, start), work_file("sva_sorted.bed"),
+  write_tsv(bind_rows(S, OTHER) %>% select(chrom, start, end, name) %>% arrange(chrom, start), work_file("sva_sorted.bed"),
             col.names = FALSE)
   Sys.setenv(AW_WORK = WORK,
              AW_GTF = normalizePath(IN$gencode_gtf, mustWork = TRUE),
@@ -1576,8 +1630,11 @@ if (!is.null(rfd_path) && !is.null(anns$repliseq) && !is.null(anns$lagging_stran
 ## XY on chrY. Without metadata only the autosomal AN is known.
 LOG("allele counts")
 is_carried <- function(x) as.numeric(toupper(stri_trim_both(x)) %in% c("TRUE", "T", "1"))
-gt <- as_tibble(fread_any(IN$genotype_table, sep = "\t", colClasses = "character", showProgress = FALSE)) %>%
-  mutate(sva_id = sprintf("SVA_MEI_cl%05d", as.integer(cluster_id)))
+read_genotypes <- function(path, id_fmt) {
+  as_tibble(fread_any(path, sep = "\t", colClasses = "character", showProgress = FALSE)) %>%
+    mutate(sva_id = sprintf(id_fmt, as.integer(cluster_id)))
+}
+gt <- read_genotypes(IN$genotype_table, "SVA_MEI_cl%05d")
 md <- NULL
 if (is.null(IN$sample_metadata)) {
   cat("No --sample-metadata: chrX genotypes are not sex-filtered and chrX/chrY AF is missing.\n")
@@ -1593,20 +1650,34 @@ AN_AUTO <- 2 * n_ind
 AN_X <- if (is.null(md)) NA_real_ else 2 * n_distinct(md$indiv[md$sex == "XX"]) + n_distinct(md$indiv[md$sex == "XY"])
 AN_Y <- if (is.null(md)) NA_real_ else as.numeric(n_distinct(md$indiv[md$sex == "XY"]))
 
-allele_counts <- gt %>%
-  mutate(n_carried = if_else(CHROM == "chrX" & indiv %in% sex_exclude, NA_real_, is_carried(hap1) + is_carried(hap2))) %>%
-  group_by(CHROM, sva_id) %>%
-  summarise(AC = sum(n_carried, na.rm = TRUE), .groups = "drop") %>%
-  mutate(AN = case_when(CHROM %in% c("chrX", "X") ~ AN_X, CHROM %in% c("chrY", "Y") ~ AN_Y, TRUE ~ AN_AUTO),
-         AF = AC / AN) %>%
-  distinct(sva_id, .keep_all = TRUE) %>%
-  select(sva_id, AC, AN, AF)
+## AC / AN / AF per element of one family's genotype table
+count_alleles <- function(gt) {
+  gt %>%
+    mutate(n_carried = if_else(CHROM == "chrX" & indiv %in% sex_exclude, NA_real_, is_carried(hap1) + is_carried(hap2))) %>%
+    group_by(CHROM, sva_id) %>%
+    summarise(AC = sum(n_carried, na.rm = TRUE), .groups = "drop") %>%
+    mutate(AN = case_when(CHROM %in% c("chrX", "X") ~ AN_X, CHROM %in% c("chrY", "Y") ~ AN_Y, TRUE ~ AN_AUTO),
+           AF = AC / AN) %>%
+    distinct(sva_id, .keep_all = TRUE) %>%
+    select(sva_id, AC, AN, AF)
+}
+allele_counts <- count_alleles(gt)
 S <- S %>%
   left_join(allele_counts, by = c("name" = "sva_id")) %>%
   mutate(across(c(AC, AN, AF), ~ if_else(class == PL, as.numeric(.x), NA_real_)))
 cat(sprintf("Genotypes: %d SVAs, %d individuals (AN autosomes %d, chrX %s); %d of %d %s SVAs have AC > 0, %d are singletons.\n",
             nrow(allele_counts), n_ind, as.integer(AN_AUTO), format(AN_X), sum(S$AC > 0, na.rm = TRUE),
             sum(S$class == PL), PL, sum(S$AC == 1, na.rm = TRUE)))
+if (nrow(OTHER)) {
+  ## the same individuals and allele numbers as the SVAs: one cohort, one call set
+  other_ac <- bind_rows(lapply(names(OTHER_FAMILIES), function(fam) {
+    count_alleles(read_genotypes(OTHER_FAMILIES[[fam]]$genotype_table, OTHER_FAMILIES[[fam]]$id_fmt))
+  }))
+  OTHER <- OTHER %>% left_join(other_ac, by = c("name" = "sva_id"))
+  show_tab(OTHER %>% group_by(family) %>%
+             summarise(n = n(), with_ac = sum(AC > 0, na.rm = TRUE), singletons = sum(AC == 1, na.rm = TRUE)),
+           caption = "Alu / L1 allele counts")
+}
 
 ## ==== 10. Structural class from the MEI structural catalog ===========================
 ## The catalog's variant_id is the MEI table's var_id by default, or
@@ -1619,13 +1690,13 @@ cat(sprintf("Genotypes: %d SVAs, %d individuals (AN autosomes %d, chrX %s); %d o
 ## full-length or truncated. catalog_subfamily is the weighted modal catalog
 ## subfamily: the catalog recognises SVA_F1 by its MAST2 exon 1, which the MEI
 ## bed's labels (RepeatMasker has no F1 consensus) call SVA_F or SVA_E.
-catalog_structure <- function(path, mei_bed) {
+catalog_structure <- function(path, mei_bed, catalog_families = "SVA", id_fmt = "SVA_MEI_cl%05d") {
   flag_cols <- c("full_length", "five_prime_truncated", "three_prime_truncated",
                  "three_prime_transduction", "five_prime_transduction")
   pv <- as_tibble(fread_any(path, sep = "\t", showProgress = FALSE))
   miss <- setdiff(c("variant_id", "structure", flag_cols), names(pv))
   if (length(miss)) stop(path, ": not a structure_per_variant table, missing ", paste(miss, collapse = ", "))
-  if ("family" %in% names(pv)) pv <- pv %>% filter(toupper(family) == "SVA")
+  if ("family" %in% names(pv)) pv <- pv %>% filter(toupper(family) %in% catalog_families)
   if (!"allele_count" %in% names(pv)) pv$allele_count <- 1
   if (!"subfamily" %in% names(pv)) pv$subfamily <- NA_character_
   pv <- pv %>% mutate(variant_id = as.character(variant_id), across(all_of(flag_cols), as.logical))
@@ -1634,8 +1705,10 @@ catalog_structure <- function(path, mei_bed) {
   setnames(b, seq_along(MEI_COLS), MEI_COLS)
   bed <- as_tibble(b) %>%
     transmute(ID = as.character(ID), chrom = as.character(chrom), start = as.integer(start),
-              cluster_id = as.integer(cluster_id)) %>%
+              cluster_id = as.integer(cluster_id), MEI_type = as.character(MEI_type)) %>%
     filter(!is.na(cluster_id))
+  ## with MeiVariantCol = cluster_id the catalog names a variant <MEI_type>_cl<id>
+  name_re <- paste0("(?i)^(", paste(unique(c(bed$MEI_type, catalog_families)), collapse = "|"), ")_cl0*(\\d+)$")
   by_id <- bed %>% distinct(ID, .keep_all = TRUE) %>% select(variant_id = ID, cluster_by_id = cluster_id)
   ## a catalog `pos` is the bed start (0-based) or start + 1; only unambiguous sites
   by_pos <- bind_rows(bed %>% transmute(chrom, pos = start, cluster_id),
@@ -1648,7 +1721,7 @@ catalog_structure <- function(path, mei_bed) {
     rename(cluster_by_pos = cluster_id)
 
   pv <- pv %>%
-    mutate(cluster_by_name = as.integer(stri_match_first_regex(variant_id, "(?i)^sva_cl0*(\\d+)$")[, 2])) %>%
+    mutate(cluster_by_name = as.integer(stri_match_first_regex(variant_id, name_re)[, 3])) %>%
     left_join(by_id, by = "variant_id")
   pv <- if (all(c("chrom", "pos") %in% names(pv))) {
     pv %>% mutate(chrom = as.character(chrom), pos = as.integer(pos)) %>% left_join(by_pos, by = c("chrom", "pos"))
@@ -1661,12 +1734,13 @@ catalog_structure <- function(path, mei_bed) {
                                   !is.na(cluster_by_id) ~ "variant_id = MEI bed ID",
                                   !is.na(cluster_by_pos) ~ "chrom + position",
                                   TRUE ~ "unmatched"))
-  show_tab(count(pv, matched_by), caption = "Catalog SVA variants matched to clustered SVAs")
+  show_tab(count(pv, matched_by), caption = sprintf("Catalog %s variants matched to clustered insertions",
+                                                     paste(catalog_families, collapse = "/")))
 
   majority <- function(x, w) sum(w * (x %in% TRUE)) / sum(w) >= 0.5
   pv %>%
     filter(!is.na(cluster_id)) %>%
-    mutate(sva_id = sprintf("SVA_MEI_cl%05d", cluster_id), w = coalesce(as.numeric(allele_count), 0)) %>%
+    mutate(sva_id = sprintf(id_fmt, cluster_id), w = coalesce(as.numeric(allele_count), 0)) %>%
     group_by(sva_id) %>%
     mutate(w = if (sum(w) > 0) w else rep(1, n())) %>%   # nothing carried: equal weights
     summarise(structure = names(which.max(tapply(w, coalesce(structure, "NA"), sum))),
@@ -1691,6 +1765,14 @@ if (!is.null(IN$catalog)) {
   show_tab(struct %>% filter(sva_id %in% S$name) %>% count(structure_group, sort = TRUE))
   cat(sprintf("%d %s SVAs relabelled SVA_F1 from the catalog (MAST2 exon 1 at the 5' end).\n",
               sum(S$name %in% struct$sva_id[struct$catalog_subfamily %in% "SVA_F1"]), PL))
+  if (nrow(OTHER)) {
+    other_struct <- bind_rows(lapply(names(OTHER_FAMILIES), function(fam) {
+      f <- OTHER_FAMILIES[[fam]]
+      catalog_structure(IN$catalog, f$bed, f$catalog_families, f$id_fmt)
+    }))
+    show_tab(OTHER %>% left_join(other_struct, by = c("name" = "sva_id")) %>% count(family, structure_group),
+             caption = "Alu / L1 structural classes")
+  }
 } else {
   cat("No --catalog-per-variant: the structure columns are left out.\n")
 }
@@ -1740,6 +1822,34 @@ if (!is.null(links) && nrow(links)) {
 tab <- tab %>% arrange(chrom, start)
 table_path <- out_path("sva_annotation_table", "tsv.gz")
 write_tsv(tab, table_path)
+
+## One table per other family (alu_annotation_table, l1_annotation_table): the
+## same per-element columns as the SVA table, minus the SVA repeat lengths.
+if (nrow(OTHER)) {
+  other_ann <- as_tibble(element_annotations(anns, OTHER$g, genome, OTHER$strand, OTHER$half))
+  names(other_ann) <- names(ann_values)
+  other_tab <- OTHER %>%
+    transmute(mei_id = name, family, chrom, start, end, strand, subfamily, class,
+              is_polymorphic = TRUE, is_singleton = AC %in% 1, ac = AC, an = AN, af = AF, width,
+              ins_length, n_alleles) %>%
+    bind_cols(other_ann)
+  if (!is.null(struct)) {
+    other_tab <- other_tab %>%
+      left_join(other_struct, by = c("mei_id" = "sva_id")) %>%
+      relocate(any_of(STRUCT_COLS), .after = width)
+  }
+  if (!is.null(links) && nrow(links)) {
+    other_tab <- other_tab %>%
+      left_join(linked, by = c("mei_id" = "sva_id")) %>%
+      mutate(n_linked_genes = coalesce(n_linked_genes, 0L))
+  }
+  for (fam in unique(other_tab$family)) {
+    fam_path <- out_path(paste0(tolower(fam), "_annotation_table"), "tsv.gz")
+    fam_tab <- other_tab %>% filter(family == fam) %>% arrange(chrom, start)
+    write_tsv(fam_tab, fam_path)
+    cat(sprintf("Wrote %s (%d %s insertions).\n", fam_path, nrow(fam_tab), fam))
+  }
+}
 
 ## Everything the notebook needs besides the table. Tables are data.tables
 ## because the notebook indexes them that way.

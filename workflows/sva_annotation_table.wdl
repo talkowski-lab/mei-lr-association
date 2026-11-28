@@ -30,6 +30,12 @@ workflow SVAAnnotationTable {
         File? SampleMetadata
         ## MEIStructuralCatalog <prefix>.structure_per_variant.tsv
         File? CatalogPerVariant
+        ## Polymorphic Alu / L1, for their own tests: each family's clustered bed (same
+        ## 12 columns as MeiBed) and FilterMEIVCF's <MEIType>_gt_tidy_clustered.txt.gz
+        File? AluBed
+        File? AluGenotypeTable
+        File? L1Bed
+        File? L1GenotypeTable
         File? Genome
         ## GC from bedtools nuc (uncompressed FASTA); or give GcBedgraph
         File? Reference
@@ -66,6 +72,10 @@ workflow SVAAnnotationTable {
             GenotypeTable = GenotypeTable,
             SampleMetadata = SampleMetadata,
             CatalogPerVariant = CatalogPerVariant,
+            AluBed = AluBed,
+            AluGenotypeTable = AluGenotypeTable,
+            L1Bed = L1Bed,
+            L1GenotypeTable = L1GenotypeTable,
             Genome = Genome,
             Reference = Reference,
             GcBedgraph = GcBedgraph,
@@ -88,6 +98,7 @@ workflow SVAAnnotationTable {
         call CopyOutputs {
             input:
                 Files = flatten([[BuildAnnotationTable.AnnotationTable, BuildAnnotationTable.AnnotationBundle],
+                                 select_all([BuildAnnotationTable.AluAnnotationTable, BuildAnnotationTable.L1AnnotationTable]),
                                  BuildAnnotationTable.Tracks]),
                 OutputDir = select_first([OutputDir]),
                 ImageTag = ImageTag
@@ -97,6 +108,8 @@ workflow SVAAnnotationTable {
     output {
         File AnnotationTable = BuildAnnotationTable.AnnotationTable
         File AnnotationBundle = BuildAnnotationTable.AnnotationBundle
+        File? AluAnnotationTable = BuildAnnotationTable.AluAnnotationTable
+        File? L1AnnotationTable = BuildAnnotationTable.L1AnnotationTable
         Array[File] Tracks = BuildAnnotationTable.Tracks
     }
 }
@@ -112,6 +125,10 @@ task BuildAnnotationTable {
         File? GenotypeTable
         File? SampleMetadata
         File? CatalogPerVariant
+        File? AluBed
+        File? AluGenotypeTable
+        File? L1Bed
+        File? L1GenotypeTable
         File? Genome
         File? Reference
         File? GcBedgraph
@@ -145,6 +162,10 @@ task BuildAnnotationTable {
             ~{"--genome " + Genome} \
             ~{"--sample-metadata " + SampleMetadata} \
             ~{"--catalog-per-variant " + CatalogPerVariant} \
+            ~{"--alu-bed " + AluBed} \
+            ~{"--alu-genotype-table " + AluGenotypeTable} \
+            ~{"--l1-bed " + L1Bed} \
+            ~{"--l1-genotype-table " + L1GenotypeTable} \
             ~{"--reference " + Reference} \
             ~{"--gc-bedgraph " + GcBedgraph} \
             ~{"--gencode-gtf " + GencodeGtf} \
@@ -172,6 +193,8 @@ task BuildAnnotationTable {
     output {
         File AnnotationTable = "~{Prefix}.sva_annotation_table.tsv.gz"
         File AnnotationBundle = "~{Prefix}.sva_annotations.rds"
+        File? AluAnnotationTable = "~{Prefix}.alu_annotation_table.tsv.gz"
+        File? L1AnnotationTable = "~{Prefix}.l1_annotation_table.tsv.gz"
         Array[File] Tracks = glob("~{Prefix}.*.bed*")
     }
 }
