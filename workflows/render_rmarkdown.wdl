@@ -9,6 +9,11 @@ version 1.0
 ## helpers) instead of relying on an AnVIL/Terra workspace. If OutputDir (a
 ## gs:// folder) is given, the report, figures and tables are also copied to
 ## OutputDir/<Rmd basename without .Rmd>/{report.*,figures/,tables/}.
+## Every data table of each TerraWorkspaces entry ("<namespace>/<workspace>")
+## is exported first and placed at terra_tables/<namespace>/<workspace>/<table>.tsv
+## (TERRA_TABLES_DIR) for the Rmd to read.
+
+import "utils/terra_tables.wdl" as TerraTableUtils
 
 workflow RenderRmarkdownReport {
   input {
@@ -23,9 +28,19 @@ workflow RenderRmarkdownReport {
     Boolean ContinueOnChunkError = false
     String? Bucket
     String? OutputDir
+    Array[String] TerraWorkspaces = []
+    String TerraImageTag = "latest"
     Int MemoryGB = 8
     Int CPU = 2
     Int? DiskGB
+  }
+
+  if (length(TerraWorkspaces) > 0) {
+    call TerraTableUtils.ExportTerraTables {
+      input:
+        Workspaces = TerraWorkspaces,
+        ImageTag = TerraImageTag
+    }
   }
 
   call RenderReport {
@@ -33,6 +48,7 @@ workflow RenderRmarkdownReport {
       RmdFile = RmdFile,
       InputData = InputData,
       RScripts = RScripts,
+      TerraTables = select_first([ExportTerraTables.Tables, []]),
       FiguresDir = FiguresDir,
       TablesDir = TablesDir,
       Format = Format,
@@ -59,6 +75,7 @@ task RenderReport {
     File RmdFile
     Array[File] InputData
     Array[File] RScripts
+    Array[File] TerraTables
     String FiguresDir
     String TablesDir
     String Format
@@ -83,7 +100,11 @@ task RenderReport {
 
   File params_json = write_json(RenderParams)
 
-  Int auto_disk_gb = ceil(size(RmdFile, "GB") + size(InputData, "GB") + size(RScripts, "GB")) * 2 + 20
+  Int auto_disk_gb = ceil(size(RmdFile, "GB") + size(InputData, "GB") + size(RScripts, "GB") + size(TerraTables, "GB")) * 2 + 20
+
+  meta {
+    volatile: true
+  }
 
   command <<<
     set -euo pipefail
@@ -105,6 +126,18 @@ task RenderReport {
 
     for f in ~{sep=" " RScripts}; do
         cp "$f" .
+    done
+
+    export TERRA_TABLES_DIR=terra_tables
+    mkdir -p "$TERRA_TABLES_DIR"
+    for f in ~{sep=" " TerraTables}; do
+        name=$(basename "$f" .tsv)
+        namespace=${name%%.*}
+        rest=${name#*.}
+        workspace=${rest%%.*}
+        table=${rest#*.}
+        mkdir -p "$TERRA_TABLES_DIR/$namespace/$workspace"
+        cp "$f" "$TERRA_TABLES_DIR/$namespace/$workspace/$table.tsv"
     done
 
     Rscript /scripts/render_rmarkdown.R \
